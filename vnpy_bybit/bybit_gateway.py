@@ -1,46 +1,27 @@
 """"""
 import hashlib
 import hmac
-import time
 import sys
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Callable
+import time
 from copy import copy
+from datetime import datetime, timedelta
+from typing import Any, Callable, Dict, List
+
 import pytz
 from pytz import timezone
-from tzlocal import get_localzone
+from requests import ConnectionError, Response
 from simplejson.errors import JSONDecodeError
-from requests import Response
-
-from vnpy.trader.constant import (
-    Exchange,
-    Interval,
-    OrderType,
-    Product,
-    Status,
-    Direction
-)
-from vnpy.trader.object import (
-    AccountData,
-    BarData,
-    TickData,
-    OrderData,
-    TradeData,
-    ContractData,
-    PositionData,
-    HistoryRequest,
-    SubscribeRequest,
-    CancelRequest,
-    OrderRequest
-)
-from vnpy.trader.event import EVENT_TIMER
-from vnpy.trader.gateway import BaseGateway
+from tzlocal import get_localzone
 from vnpy.event.engine import EventEngine
-
-from requests import ConnectionError
+from vnpy.trader.constant import (Direction, Exchange, Interval, OrderType,
+                                  Product, Status)
+from vnpy.trader.gateway import BaseGateway
+from vnpy.trader.object import (AccountData, BarData, CancelRequest,
+                                ContractData, HistoryRequest, OrderData,
+                                OrderRequest, PositionData, SubscribeRequest,
+                                TickData, TradeData)
+from vnpy_rest import Request, RestClient
 from vnpy_websocket import WebsocketClient
-from vnpy_rest import RestClient, Request
-
 
 # 本地时区
 LOCAL_TZ: timezone = get_localzone()
@@ -110,6 +91,9 @@ symbols_usdt: List[str] = ["BTCUSDT"]
 # 反向合约类型列表
 symbols_inverse: List[str] = ["BTCUSD", "ETHUSD", "EOSUSD", "XRPUSD"]
 
+# 合约数据全局缓存字典
+symbol_contract_map: Dict[str, ContractData] = {}
+
 
 class BybitGateway(BaseGateway):
     """
@@ -175,8 +159,6 @@ class BybitGateway(BaseGateway):
             proxy_port
         )
 
-        self.event_engine.register(EVENT_TIMER, self.process_timer_event)
-
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
         self.public_ws_api.subscribe(req)
@@ -196,7 +178,6 @@ class BybitGateway(BaseGateway):
     def query_position(self) -> None:
         """查询持仓"""
         return
-        self.rest_api.query_position()
 
     def query_history(self, req: HistoryRequest) -> List[BarData]:
         """查询历史数据"""
@@ -207,10 +188,6 @@ class BybitGateway(BaseGateway):
         self.rest_api.stop()
         self.private_ws_api.stop()
         self.public_ws_api.stop()
-
-    def process_timer_event(self, event):
-        """处理定时事件"""
-        self.query_position()
 
 
 class BybitRestApi(RestClient):
@@ -228,18 +205,18 @@ class BybitRestApi(RestClient):
         self.secret: bytes = b""
 
         self.order_count: int = 0
-        self.contract_codes: set = set()
+        #self.contract_codes: set = set()
 
     def sign(self, request: Request) -> Request:
         """ 生成ByBit签名"""
         request.headers = {"Referer": "vn.py"}
 
         if request.method == "GET":
-            api_params = request.params
+            api_params: dict = request.params
             if api_params is None:
                 api_params = request.params = {}
         else:
-            api_params = request.data
+            api_params: dict = request.data
             if api_params is None:
                 api_params = request.data = {}
 
@@ -291,13 +268,24 @@ class BybitRestApi(RestClient):
 
     def send_order(self, req: OrderRequest) -> str:
         """委托下单"""
+        # 检查合约代码是否正确
+        contract: ContractData = symbol_contract_map.get(req.symbol, None)
+        if not contract:
+            self.gateway.write_log(f"委托失败，找不到该合约代码{req.symbol}")
+            return
+
         orderid: str = self.new_orderid()
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
 
+        if contract.min_volume == 1:
+            qty: int = (req.volume)
+        else:
+            qty: float = req.volume
+        
         data: dict = {
             "symbol": req.symbol,
             "side": DIRECTION_VT2BYBIT[req.direction],
-            "qty": float(req.volume),
+            "qty": qty,
             "order_link_id": orderid,
             "time_in_force": "GoodTillCancel",
             "reduce_only": False,
@@ -353,7 +341,6 @@ class BybitRestApi(RestClient):
         order.status = Status.REJECTED
         self.gateway.on_order(order)
 
-        # Record exception if not ConnectionError
         if not issubclass(exception_type, ConnectionError):
             self.on_error(exception_type, exception_value, tb, request)
 
@@ -392,7 +379,6 @@ class BybitRestApi(RestClient):
         request: Request
     ) -> None:
         """委托撤单回报函数报错回报"""
-        # Record exception if not ConnectionError
         if not issubclass(exception_type, ConnectionError):
             self.on_error(exception_type, exception_value, tb, request)
 
@@ -409,7 +395,7 @@ class BybitRestApi(RestClient):
             error_code: int = data["ret_code"]
             msg = f"请求失败，状态码：{request.status}，错误代码：{error_code}, 信息：{error_msg}"
         except JSONDecodeError:
-            text = request.response.text
+            text: str = request.response.text
             msg = f"请求失败，信息：{text}"
 
         self.gateway.write_log(msg)
@@ -434,38 +420,54 @@ class BybitRestApi(RestClient):
         if self.check_error("查询持仓", data):
             return
 
-        for d in data["result"]:
-            if d["side"] == "Buy":
-                volume = d["size"]
-            else:
-                volume = -d["size"]
-
-            position: PositionData = PositionData(
-                symbol=d["symbol"],
-                exchange=Exchange.BYBIT,
-                direction=Direction.NET,
-                volume=volume,
-                price=d["entry_price"],
-                gateway_name=self.gateway_name
-            )
-            self.gateway.on_position(position)
-
-            if not self.usdt_base:
-                account: AccountData = AccountData(
-                    accountid=d["symbol"].replace("USD", ""),
-                    balance=d["wallet_balance"],
-                    frozen=d["order_margin"],
-                    gateway_name=self.gateway_name,
+        if self.usdt_base:
+            for d in data["result"]:
+                size = d.get("size", None)
+                if not size:
+                    return
+                if d["side"] == "Buy":
+                    volume = d["size"]
+                else:
+                    volume = -d["size"]
+    
+                position: PositionData = PositionData(
+                    symbol=d["symbol"],
+                    exchange=Exchange.BYBIT,
+                    direction=Direction.NET,
+                    volume=volume,
+                    price=d["entry_price"],
+                    gateway_name=self.gateway_name
                 )
-                self.gateway.on_account(account)
+                self.gateway.on_position(position)
+            
+        else:
+            for d in data["result"]:
+                data = d["data"]
+                size = data.get("size", None)
+                if not size:
+                    return
+                if data["side"] == "Buy":
+                    volume = data["size"]
+                else:
+                    volume = -data["size"]
+    
+                position: PositionData = PositionData(
+                    symbol=data["symbol"],
+                    exchange=Exchange.BYBIT,
+                    direction=Direction.NET,
+                    volume=volume,
+                    price=data["entry_price"],
+                    gateway_name=self.gateway_name
+                )
+                self.gateway.on_position(position)
 
     def on_query_contract(self, data: dict, request: Request) -> None:
         """合约查询回报"""
         if self.check_error("查询合约", data):
             return
-
+        
         for d in data["result"]:
-            self.contract_codes.add(d["name"])
+            #self.contract_codes.add(d["name"])
 
             contract: ContractData = ContractData(
                 symbol=d["name"],
@@ -481,8 +483,10 @@ class BybitRestApi(RestClient):
             )
 
             if self.usdt_base and "USDT" in contract.symbol:
+                symbol_contract_map[contract.symbol] = contract
                 self.gateway.on_contract(contract)
             elif not self.usdt_base and "USDT" not in contract.symbol:
+                symbol_contract_map[contract.symbol] = contract
                 self.gateway.on_contract(contract)
 
         self.gateway.write_log("合约信息查询成功")
@@ -574,31 +578,33 @@ class BybitRestApi(RestClient):
 
     def query_account(self) -> None:
         """查询资金"""
-        params: dict = {"coin": "USDT"}
         self.add_request(
             "GET",
             "/v2/private/wallet/balance",
-            self.on_query_account,
-            params
+            self.on_query_account
         )
 
     def query_position(self) -> None:
         """查询持仓"""
         if self.usdt_base:
             path: str = "/private/linear/position/list"
-            symbols: list = symbols_usdt
         else:
-            path: str = "/position/list"
-            symbols: list = symbols_inverse
+            path_swap: str = "/v2/private/position/list"
+            path_future: str = "/futures/private/position/list"
+            #symbols: list = symbols_inverse
 
-        for symbol in symbols:
-            params: dict = {"symbol": symbol}
+#        for symbol in symbols:
+#            params: dict = {"symbol": symbol}
 
             self.add_request(
                 "GET",
-                path,
-                self.on_query_position,
-                params
+                path_swap,
+                self.on_query_position
+            )
+            self.add_request(
+                "GET",
+                path_future,
+                self.on_query_position
             )
 
     def query_order(self, page: int = 1) -> None:
@@ -607,7 +613,7 @@ class BybitRestApi(RestClient):
             path: str = "/private/linear/order/list"
             symbols: list = symbols_usdt
         else:
-            path: str = "/open-api/order/list"
+            path: str = "/v2/private/order/list"
             symbols: list = symbols_inverse
 
         for symbol in symbols:
@@ -637,7 +643,7 @@ class BybitRestApi(RestClient):
             path: str = "/v2/public/kline/list"
 
         while True:
-            # Create query params
+            # 创建查询参数
             params: dict = {
                 "symbol": req.symbol,
                 "interval": INTERVAL_VT2BYBIT[req.interval],
@@ -645,14 +651,14 @@ class BybitRestApi(RestClient):
                 "limit": count
             }
 
-            # Get response from server
+            # 从服务器获取响应
             resp: Response = self.request(
                 "GET",
                 path,
                 params=params
             )
 
-            # Break if request failed with other status code
+            # 如果请求失败则终止循环
             if resp.status_code // 100 != 2:
                 msg = f"获取历史数据失败，状态码：{resp.status_code}，信息：{resp.text}"
                 self.gateway.write_log(msg)
@@ -698,11 +704,11 @@ class BybitRestApi(RestClient):
                 msg = f"获取历史数据成功，{req.symbol} - {req.interval.value}，{begin} - {end}"
                 self.gateway.write_log(msg)
 
-                # Break if last data collected
+                # 收到最后数据则结束循环
                 if len(buf) < count:
                     break
 
-                # Update start time
+                # 更新开始时间
                 start_time: int = int((bar.datetime + TIMEDELTA_MAP[req.interval]).timestamp())
 
         return history
@@ -830,7 +836,7 @@ class BybitPublicWebsocketApi(WebsocketClient):
         tick: TickData = self.ticks[symbol]
 
         if type_ == "snapshot":
-            if not data["last_price_e4"]:           # Filter last price with 0 value
+            if not data["last_price_e4"]:           # 过滤最新价为0的数据
                 return
 
             tick.last_price = int(data["last_price_e4"]) / 10000
@@ -845,7 +851,7 @@ class BybitPublicWebsocketApi(WebsocketClient):
             update: dict = data["update"][0]
 
             if "last_price_e4" in update:
-                if not update["last_price_e4"]:     # Filter last price with 0 value
+                if not update["last_price_e4"]:     # 过滤最新价为0的数据
                     return
                 tick.last_price = int(update["last_price_e4"]) / 10000
 
@@ -864,7 +870,6 @@ class BybitPublicWebsocketApi(WebsocketClient):
         type_: str = packet["type"]
         data: dict = packet["data"]
 
-        # Update depth data into dict buf
         symbol: str = topic.replace("orderBookL2_25.", "")
         tick: TickData = self.ticks[symbol]
         bids: dict = self.symbol_bids.setdefault(symbol, {})
@@ -887,6 +892,8 @@ class BybitPublicWebsocketApi(WebsocketClient):
             for d in data["delete"]:
                 price: float = float(d["price"])
                 if d["side"] == "Buy":
+                    #print("BIDS, ",bids)
+                    #print("PRICE, ",price)
                     bids.pop(price)
                 else:
                     asks.pop(price)
@@ -898,7 +905,6 @@ class BybitPublicWebsocketApi(WebsocketClient):
                 else:
                     asks[price] = d
 
-        # Calculate 1-5 bid/ask depth
         bid_keys: list = list(bids.keys())
         bid_keys.sort(reverse=True)
 
@@ -934,7 +940,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
 
         self.key: str = ""
         self.secret: bytes = b""
-        self.server: str = ""  # REAL or TESTNET
+        self.server: str = ""
         self.usdt_base: bool = False
 
         self.callbacks: Dict[str, Callable] = {}
@@ -1108,6 +1114,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
     def on_position(self, packet: dict) -> None:
         """持仓更新推送"""
         for d in packet["data"]:
+            print("on_position,", d)
             if d["side"] == "Buy":
                 volume = d["size"]
             else:
@@ -1144,8 +1151,8 @@ def generate_datetime(timestamp: str) -> datetime:
             part2 = part2[:6] + "Z"
             timestamp = ".".join([part1, part2])
 
-        dt = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ")
+        dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ")
     else:
-        dt = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+        dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
     dt = UTC_TZ.localize(dt)
     return dt
