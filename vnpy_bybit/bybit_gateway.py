@@ -5,7 +5,7 @@ import sys
 import time
 from copy import copy
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Set
 
 import pytz
 from pytz import timezone
@@ -85,14 +85,14 @@ TIMEDELTA_MAP: Dict[Interval, timedelta] = {
     Interval.WEEKLY: timedelta(days=7),
 }
 
-# 正向合约类型列表
-symbols_usdt: List[str] = ["BTCUSDT"]
+# 反向永续合约类型列表
+symbols_swap: List[str] = []
 
-# 反向合约类型列表
-symbols_inverse: List[str] = ["BTCUSD", "ETHUSD", "EOSUSD", "XRPUSD"]
+# 反向交割合约类型列表
+symbols_future: List[str] = []
 
-# 合约数据全局缓存字典
-symbol_contract_map: Dict[str, ContractData] = {}
+# 本地委托号缓存集合
+local_orderids: Set[str] = set()
 
 
 class BybitGateway(BaseGateway):
@@ -104,7 +104,6 @@ class BybitGateway(BaseGateway):
         "ID": "",
         "Secret": "",
         "服务器": ["REAL", "TESTNET"],
-        "合约模式": ["反向", "正向"],
         "代理地址": "",
         "代理端口": "",
     }
@@ -127,18 +126,12 @@ class BybitGateway(BaseGateway):
         proxy_host: str = setting["代理地址"]
         proxy_port: str = setting["代理端口"]
 
-        if setting["合约模式"] == "正向":
-            usdt_base = True
-        else:
-            usdt_base = False
-
         if proxy_port.isdigit():
             proxy_port = int(proxy_port)
         else:
             proxy_port = 0
 
         self.rest_api.connect(
-            usdt_base,
             key,
             secret,
             server,
@@ -146,14 +139,12 @@ class BybitGateway(BaseGateway):
             proxy_port
         )
         self.private_ws_api.connect(
-            usdt_base,
             key, secret,
             server,
             proxy_host,
             proxy_port
         )
         self.public_ws_api.connect(
-            usdt_base,
             server,
             proxy_host,
             proxy_port
@@ -200,12 +191,10 @@ class BybitRestApi(RestClient):
         self.gateway: BybitGateway = gateway
         self.gateway_name: str = gateway.gateway_name
 
-        self.usdt_base: bool = False
         self.key: str = ""
         self.secret: bytes = b""
 
         self.order_count: int = 0
-        #self.contract_codes: set = set()
 
     def sign(self, request: Request) -> Request:
         """ 生成ByBit签名"""
@@ -243,7 +232,6 @@ class BybitRestApi(RestClient):
 
     def connect(
         self,
-        usdt_base: bool,
         key: str,
         secret: str,
         server: str,
@@ -251,7 +239,6 @@ class BybitRestApi(RestClient):
         proxy_port: int,
     ) -> None:
         """连接REST服务器"""
-        self.usdt_base = usdt_base
         self.key = key
         self.secret = secret.encode()
 
@@ -264,28 +251,16 @@ class BybitRestApi(RestClient):
         self.gateway.write_log("REST API启动成功")
 
         self.query_contract()
-        self.query_order()
 
     def send_order(self, req: OrderRequest) -> str:
         """委托下单"""
-        # 检查合约代码是否正确
-        contract: ContractData = symbol_contract_map.get(req.symbol, None)
-        if not contract:
-            self.gateway.write_log(f"委托失败，找不到该合约代码{req.symbol}")
-            return
-
         orderid: str = self.new_orderid()
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
-
-        if contract.min_volume == 1:
-            qty: int = (req.volume)
-        else:
-            qty: float = req.volume
         
         data: dict = {
             "symbol": req.symbol,
             "side": DIRECTION_VT2BYBIT[req.direction],
-            "qty": qty,
+            "qty": int(req.volume),
             "order_link_id": orderid,
             "time_in_force": "GoodTillCancel",
             "reduce_only": False,
@@ -295,10 +270,7 @@ class BybitRestApi(RestClient):
         data["order_type"] = ORDER_TYPE_VT2BYBIT[req.type]
         data["price"] = req.price
 
-        if self.usdt_base:
-            path: str = "/private/linear/order/create"
-        else:
-            path: str = "/v2/private/order/create"
+        path: str = "/v2/private/order/create"
 
         self.add_request(
             "POST",
@@ -354,15 +326,15 @@ class BybitRestApi(RestClient):
 
     def cancel_order(self, req: CancelRequest) -> None:
         """委托撤单"""
-        data: dict = {
-            "symbol": req.symbol,
-            "order_link_id": req.orderid
-        }
+        data: dict = {"symbol": req.symbol}
 
-        if self.usdt_base:
-            path: str = "/private/linear/order/cancel"
+        # 检查是否为本地委托号
+        if req.orderid in local_orderids:
+            data["order_link_id"] = req.orderid
         else:
-            path: str = "/v2/private/order/cancel"
+            data["order_id"] = req.orderid
+
+        path: str = "/v2/private/order/cancel"
 
         self.add_request(
             "POST",
@@ -420,16 +392,17 @@ class BybitRestApi(RestClient):
         if self.check_error("查询持仓", data):
             return
 
-        if self.usdt_base:
-            for d in data["result"]:
-                size = d.get("size", None)
-                if not size:
-                    return
+        data = data["result"]
+     
+        for d in data:
+            d = d["data"]
+    
+            if d["size"]:
                 if d["side"] == "Buy":
                     volume = d["size"]
                 else:
                     volume = -d["size"]
-    
+                
                 position: PositionData = PositionData(
                     symbol=d["symbol"],
                     exchange=Exchange.BYBIT,
@@ -439,35 +412,13 @@ class BybitRestApi(RestClient):
                     gateway_name=self.gateway_name
                 )
                 self.gateway.on_position(position)
-            
-        else:
-            for d in data["result"]:
-                data = d["data"]
-                size = data.get("size", None)
-                if not size:
-                    return
-                if data["side"] == "Buy":
-                    volume = data["size"]
-                else:
-                    volume = -data["size"]
-    
-                position: PositionData = PositionData(
-                    symbol=data["symbol"],
-                    exchange=Exchange.BYBIT,
-                    direction=Direction.NET,
-                    volume=volume,
-                    price=data["entry_price"],
-                    gateway_name=self.gateway_name
-                )
-                self.gateway.on_position(position)
 
     def on_query_contract(self, data: dict, request: Request) -> None:
         """合约查询回报"""
         if self.check_error("查询合约", data):
             return
-        
+
         for d in data["result"]:
-            #self.contract_codes.add(d["name"])
 
             contract: ContractData = ContractData(
                 symbol=d["name"],
@@ -481,17 +432,18 @@ class BybitRestApi(RestClient):
                 history_data=True,
                 gateway_name=self.gateway_name
             )
-
-            if self.usdt_base and "USDT" in contract.symbol:
-                symbol_contract_map[contract.symbol] = contract
+            
+            if d["name"] == d["alias"] and d["quote_currency"] != "USDT":
+                symbols_swap.append(d["name"])
                 self.gateway.on_contract(contract)
-            elif not self.usdt_base and "USDT" not in contract.symbol:
-                symbol_contract_map[contract.symbol] = contract
+            elif d["name"] != d["alias"]:
+                symbols_future.append(d["name"])
                 self.gateway.on_contract(contract)
 
         self.gateway.write_log("合约信息查询成功")
         self.query_position()
         self.query_account()
+        self.query_order()
 
     def on_query_account(self, data: dict, request: Request) -> None:
         """资金查询回报"""
@@ -499,40 +451,29 @@ class BybitRestApi(RestClient):
             return
 
         for key, value in data["result"].items():
-            account: AccountData = AccountData(
-                accountid=key,
-                balance=value["wallet_balance"],
-                frozen=value["order_margin"],
-                gateway_name=self.gateway_name,
-            )
-            self.gateway.on_account(account)
+            if key != "USDT":
+                account: AccountData = AccountData(
+                    accountid=key,
+                    balance=value["wallet_balance"],
+                    frozen=value["used_margin"],
+                    gateway_name=self.gateway_name,
+                )
+                self.gateway.on_account(account)
 
     def on_query_order(self, data: dict, request: Request):
         """未成交委托查询回报"""
         if self.check_error("查询委托", data):
             return
 
-        params: dict = request.params
-        symbol: str = params["symbol"]
-
-        result: dict = data["result"]
-        if not result:
-            self.gateway.write_log(f"{symbol}委托信息查询成功")
+        if not data["result"]:
             return
 
-        if not result["data"]:
-            self.gateway.write_log(f"{symbol}委托信息查询成功")
-            return
-
-        for d in result["data"]:
+        for d in data["result"]:
             orderid: str = d["order_link_id"]
-            if not orderid:     # Ignore order not placed by vn.py
-                continue
+            if not orderid:     
+                orderid: str = d["order_id"]
 
-            if self.usdt_base:
-                dt: datetime = generate_datetime(d["created_time"])
-            else:
-                dt: datetime = generate_datetime(d["created_at"])
+            dt: datetime = generate_datetime(d["created_at"])
 
             order: OrderData = OrderData(
                 symbol=d["symbol"],
@@ -549,13 +490,7 @@ class BybitRestApi(RestClient):
             )
             self.gateway.on_order(order)
 
-        if (
-            "last_page" in result
-            and result["current_page"] != result["last_page"]
-        ):
-            self.query_order(result["current_page"] + 1)
-        else:
-            self.gateway.write_log(f"{symbol}委托信息查询成功")
+        self.gateway.write_log(f"{order.symbol}委托信息查询成功")
 
     def query_contract(self) -> None:
         """查询合约信息"""
@@ -586,47 +521,52 @@ class BybitRestApi(RestClient):
 
     def query_position(self) -> None:
         """查询持仓"""
-        if self.usdt_base:
-            path: str = "/private/linear/position/list"
-        else:
-            path_swap: str = "/v2/private/position/list"
-            path_future: str = "/futures/private/position/list"
-            #symbols: list = symbols_inverse
 
-#        for symbol in symbols:
-#            params: dict = {"symbol": symbol}
+        path_swap: str = "/v2/private/position/list"
+        
+        self.add_request(
+            "GET",
+            path_swap,
+            self.on_query_position
+        )
 
-            self.add_request(
-                "GET",
-                path_swap,
-                self.on_query_position
-            )
-            self.add_request(
-                "GET",
-                path_future,
-                self.on_query_position
-            )
+        path_future: str = "/futures/private/position/list"
 
-    def query_order(self, page: int = 1) -> None:
+        self.add_request(
+            "GET",
+            path_future,
+            self.on_query_position
+        )
+
+    def query_order(self) -> None:
         """查询未成交委托"""
-        if self.usdt_base:
-            path: str = "/private/linear/order/list"
-            symbols: list = symbols_usdt
-        else:
-            path: str = "/v2/private/order/list"
-            symbols: list = symbols_inverse
+
+        path_swap: str = "/v2/private/order"
+        symbols: list = symbols_swap
 
         for symbol in symbols:
             params: dict = {
-                "symbol": symbol,
-                "limit": 50,
-                "page": page,
-                "order_status": "New,PartiallyFilled"
+                "symbol": symbol
             }
 
             self.add_request(
                 "GET",
-                path,
+                path_swap,
+                callback=self.on_query_order,
+                params=params
+            )
+
+        path_future: str = "/futures/private/order"
+        symbols: list = symbols_future
+
+        for symbol in symbols:
+            params: dict = {
+                "symbol": symbol
+            }
+
+            self.add_request(
+                "GET",
+                path_future,
                 callback=self.on_query_order,
                 params=params
             )
@@ -637,10 +577,7 @@ class BybitRestApi(RestClient):
         count: int = 200
         start_time: int = int(req.start.timestamp())
 
-        if self.usdt_base:
-            path: str = "/public/linear/kline"
-        else:
-            path: str = "/v2/public/kline/list"
+        path: str = "/v2/public/kline/list"
 
         while True:
             # 创建查询参数
@@ -724,8 +661,6 @@ class BybitPublicWebsocketApi(WebsocketClient):
         self.gateway: BybitGateway = gateway
         self.gateway_name: str = gateway.gateway_name
 
-        self.usdt_base: bool = False
-
         self.callbacks: Dict[str, Callable] = {}
         self.ticks: Dict[str, TickData] = {}
         self.subscribed: Dict[str, SubscribeRequest] = {}
@@ -735,27 +670,19 @@ class BybitPublicWebsocketApi(WebsocketClient):
 
     def connect(
         self,
-        usdt_base: bool,
         server: str,
         proxy_host: str,
         proxy_port: int
     ) -> None:
         """连接Websocket公共频道"""
-        self.usdt_base = usdt_base
         self.proxy_host = proxy_host
         self.proxy_port = proxy_port
         self.server = server
 
         if self.server == "REAL":
-            if usdt_base:
-                url = PUBLIC_WEBSOCKET_HOST
-            else:
-                url = INVERSE_WEBSOCKET_HOST
+            url = INVERSE_WEBSOCKET_HOST
         else:
-            if usdt_base:
-                url = TESTNET_PUBLIC_WEBSOCKET_HOST
-            else:
-                url = TESTNET_INVERSE_WEBSOCKET_HOST
+            url = TESTNET_INVERSE_WEBSOCKET_HOST
 
         self.init(url, self.proxy_host, self.proxy_port)
         self.start()
@@ -834,33 +761,40 @@ class BybitPublicWebsocketApi(WebsocketClient):
 
         symbol: str = topic.replace("instrument_info.100ms.", "")
         tick: TickData = self.ticks[symbol]
+        # print("on_tick", data)
 
         if type_ == "snapshot":
             if not data["last_price_e4"]:           # 过滤最新价为0的数据
                 return
 
-            tick.last_price = int(data["last_price_e4"]) / 10000
+            tick.last_price = data["last_price_e4"] / 10000
 
-            if self.usdt_base:
-                tick.volume = int(data["volume_24h_e8"]) / 100000000
+            tick.volume = data["volume_24h"]
+
+            update: str = data.get("updated_at", None)
+            if update:
+                # print("0", symbol, data["updated_at"])
+                tick.datetime = generate_datetime(data["updated_at"])
             else:
-                tick.volume = int(data["volume_24h"])
-
-            tick.datetime = generate_datetime(data["updated_at"])
+                # print("1", symbol, data["updated_at_e9"])
+                tick.datetime = generate_datetime_2(data["updated_at_e9"] / 1000000000)
         else:
             update: dict = data["update"][0]
 
             if "last_price_e4" in update:
                 if not update["last_price_e4"]:     # 过滤最新价为0的数据
                     return
-                tick.last_price = int(update["last_price_e4"]) / 10000
+                tick.last_price = update["last_price_e4"] / 10000
 
-            if "volume_24h_e8" in update:
-                tick.volume = int(update["volume_24h_e8"]) / 100000000
-            elif "volume_24h" in update:
-                tick.volume = int(update["volume_24h"])
+            if "volume_24h" in update:
+                tick.volume = update["volume_24h"]
 
-            tick.datetime = generate_datetime(update["updated_at"])
+            if "updated_at" in update:
+                # print("2", symbol, update["updated_at"])
+                tick.datetime = generate_datetime(update["updated_at"])
+            else:
+                if "time_to_settle" in update and "settle_time_e9" in update:
+                    tick.datetime = generate_datetime_2((update["settle_time_e9"] / 1000000000) - update["time_to_settle"])
 
         self.gateway.on_tick(copy(tick))
 
@@ -869,6 +803,8 @@ class BybitPublicWebsocketApi(WebsocketClient):
         topic: str = packet["topic"]
         type_: str = packet["type"]
         data: dict = packet["data"]
+        if not data:
+            return
 
         symbol: str = topic.replace("orderBookL2_25.", "")
         tick: TickData = self.ticks[symbol]
@@ -876,10 +812,8 @@ class BybitPublicWebsocketApi(WebsocketClient):
         asks: dict = self.symbol_asks.setdefault(symbol, {})
 
         if type_ == "snapshot":
-            if self.usdt_base:
-                buf: list = data["order_book"]
-            else:
-                buf: list = data
+
+            buf: list = data
 
             for d in buf:
                 price: float = float(d["price"])
@@ -941,7 +875,6 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         self.key: str = ""
         self.secret: bytes = b""
         self.server: str = ""
-        self.usdt_base: bool = False
 
         self.callbacks: Dict[str, Callable] = {}
         self.ticks: Dict[str, TickData] = {}
@@ -952,7 +885,6 @@ class BybitPrivateWebsocketApi(WebsocketClient):
 
     def connect(
         self,
-        usdt_base: bool,
         key: str,
         secret: str,
         server: str,
@@ -960,7 +892,6 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         proxy_port: int
     ) -> None:
         """连接Websocket私有频道"""
-        self.usdt_base = usdt_base
         self.key = key
         self.secret = secret.encode()
         self.proxy_host = proxy_host
@@ -968,15 +899,9 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         self.server = server
 
         if self.server == "REAL":
-            if usdt_base:
-                url = PRIVATE_WEBSOCKET_HOST
-            else:
-                url = INVERSE_WEBSOCKET_HOST
+            url = INVERSE_WEBSOCKET_HOST
         else:
-            if usdt_base:
-                url = TESTNET_PRIVATE_WEBSOCKET_HOST
-            else:
-                url = TESTNET_INVERSE_WEBSOCKET_HOST
+            url = TESTNET_INVERSE_WEBSOCKET_HOST
 
         self.init(url, self.proxy_host, self.proxy_port)
         self.start()
@@ -1050,21 +975,8 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             self.subscribe_topic("execution", self.on_trade)
             self.subscribe_topic("position", self.on_position)
 
-            if self.usdt_base:
-                self.subscribe_topic("wallet", self.on_account)
         else:
             self.gateway.write_log("交易Websocket API登录失败")
-
-    def on_account(self, packet: dict) -> None:
-        """资金更新推送"""
-        for d in packet["data"]:
-            account: AccountData = AccountData(
-                accountid="USDT",
-                balance=d["wallet_balance"],
-                frozen=d["wallet_balance"] - d["available_balance"],
-                gateway_name=self.gateway_name,
-            )
-            self.gateway.on_account(account)
 
     def on_trade(self, packet: dict) -> None:
         """成交更新推送"""
@@ -1084,21 +996,24 @@ class BybitPrivateWebsocketApi(WebsocketClient):
                 datetime=generate_datetime(d["trade_time"]),
                 gateway_name=self.gateway_name,
             )
-
+              
             self.gateway.on_trade(trade)
 
     def on_order(self, packet: dict) -> None:
         """委托更新推送"""
         for d in packet["data"]:
-            if self.usdt_base:
-                dt: datetime = generate_datetime(d["create_time"])
+            order_id: str = d["order_link_id"]
+            if order_id:
+                local_orderids.add(order_id)
             else:
-                dt: datetime = generate_datetime(d["timestamp"])
+                order_id: str = d["order_id"]
+
+            dt: datetime = generate_datetime(d["timestamp"])
 
             order: OrderData = OrderData(
                 symbol=d["symbol"],
                 exchange=Exchange.BYBIT,
-                orderid=d["order_link_id"],
+                orderid=order_id,
                 type=ORDER_TYPE_BYBIT2VT[d["order_type"]],
                 direction=DIRECTION_BYBIT2VT[d["side"]],
                 price=float(d["price"]),
@@ -1114,7 +1029,6 @@ class BybitPrivateWebsocketApi(WebsocketClient):
     def on_position(self, packet: dict) -> None:
         """持仓更新推送"""
         for d in packet["data"]:
-            print("on_position,", d)
             if d["side"] == "Buy":
                 volume = d["size"]
             else:
@@ -1129,6 +1043,16 @@ class BybitPrivateWebsocketApi(WebsocketClient):
                 gateway_name=self.gateway_name
             )
             self.gateway.on_position(position)
+
+            balance: float = get_float_value(d, "wallet_balance")
+            frozen: float = balance - get_float_value(d, "available_balance") 
+            account: AccountData = AccountData(
+                accountid=d["symbol"].replace("USD", ""),
+                balance=balance,
+                frozen=frozen,
+                gateway_name=self.gateway_name,
+            )
+            self.gateway.on_account(account)
 
 
 def generate_timestamp(expire_after: float = 30) -> int:
@@ -1154,5 +1078,19 @@ def generate_datetime(timestamp: str) -> datetime:
         dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ")
     else:
         dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
-    dt = UTC_TZ.localize(dt)
+    dt: datetime = UTC_TZ.localize(dt)
     return dt
+
+def generate_datetime_2(timestamp: int) -> datetime:
+    """生成时间"""
+    dt: datetime = datetime.fromtimestamp(timestamp)
+    dt: datetime = UTC_TZ.localize(dt)
+    return dt
+
+
+def get_float_value(data: dict, key: str) -> float:
+    """获取字典中对应键的浮点数值"""
+    data_str: str = data.get(key, "")
+    if not data_str:
+        return 0.0
+    return float(data_str)
