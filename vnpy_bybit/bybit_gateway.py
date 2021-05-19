@@ -452,7 +452,7 @@ class BybitRestApi(RestClient):
             return
 
         for d in data["result"]:
-
+            # 提取信息生成合约对象
             contract: ContractData = ContractData(
                 symbol=d["name"],
                 exchange=Exchange.BYBIT,
@@ -466,9 +466,11 @@ class BybitRestApi(RestClient):
                 gateway_name=self.gateway_name
             )
 
+            # 缓存反向永续合约信息并推送
             if d["name"] == d["alias"] and d["quote_currency"] != "USDT":
                 symbols_swap.append(d["name"])
                 self.gateway.on_contract(contract)
+            # 缓存反向交割合约信息并推送
             elif d["name"] != d["alias"]:
                 symbols_future.append(d["name"])
                 self.gateway.on_contract(contract)
@@ -502,6 +504,7 @@ class BybitRestApi(RestClient):
         if not data["result"]:
             return
 
+       # 检查是否为本地委托号
         for d in data["result"]:
             orderid: str = d["order_link_id"]
             if orderid:
@@ -558,7 +561,6 @@ class BybitRestApi(RestClient):
     def query_position(self) -> None:
         """查询持仓"""
         path_swap: str = "/v2/private/position/list"
-
         self.add_request(
             "GET",
             path_swap,
@@ -566,7 +568,6 @@ class BybitRestApi(RestClient):
         )
 
         path_future: str = "/futures/private/position/list"
-
         self.add_request(
             "GET",
             path_future,
@@ -735,8 +736,10 @@ class BybitPublicWebsocketApi(WebsocketClient):
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
+        # 缓存订阅记录
         self.subscribed[req.symbol] = req
 
+        # 创建TICK对象
         tick: TickData = TickData(
             symbol=req.symbol,
             exchange=req.exchange,
@@ -746,6 +749,7 @@ class BybitPublicWebsocketApi(WebsocketClient):
         )
         self.ticks[req.symbol] = tick
 
+        # 发送订阅请求
         self.subscribe_topic(f"instrument_info.100ms.{req.symbol}", self.on_tick)
         self.subscribe_topic(f"orderBookL2_25.{req.symbol}", self.on_depth)
 
@@ -1002,6 +1006,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
 
     def on_trade(self, packet: dict) -> None:
         """成交更新推送"""
+        # 检查是否为本地委托号
         for d in packet["data"]:
             orderid: str = d["order_link_id"]
             if not orderid:
@@ -1023,6 +1028,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
 
     def on_order(self, packet: dict) -> None:
         """委托更新推送"""
+        # 检查是否为本地委托号
         for d in packet["data"]:
             orderid: str = d["order_link_id"]
             if orderid:
