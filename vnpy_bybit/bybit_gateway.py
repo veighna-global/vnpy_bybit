@@ -11,23 +11,34 @@ import pytz
 from pytz import timezone
 from requests import ConnectionError, Response
 from simplejson.errors import JSONDecodeError
-from tzlocal import get_localzone
 from vnpy.event.engine import EventEngine
-from vnpy.trader.constant import (Direction, Exchange, Interval, OrderType,
-                                  Product, Status)
+from vnpy.trader.constant import (
+    Direction,
+    Exchange,
+    Interval,
+    OrderType,
+    Product,
+    Status
+)
 from vnpy.trader.gateway import BaseGateway
-from vnpy.trader.object import (AccountData, BarData, CancelRequest,
-                                ContractData, HistoryRequest, OrderData,
-                                OrderRequest, PositionData, SubscribeRequest,
-                                TickData, TradeData)
+from vnpy.trader.object import (
+    AccountData,
+    BarData,
+    CancelRequest,
+    ContractData,
+    HistoryRequest,
+    OrderData,
+    OrderRequest,
+    PositionData,
+    SubscribeRequest,
+    TickData,
+    TradeData
+)
 from vnpy_rest import Request, RestClient
 from vnpy_websocket import WebsocketClient
 
-# 本地时区
-LOCAL_TZ: timezone = get_localzone()
-
-# UTC时区
-UTC_TZ = pytz.utc
+# 中国时区
+CHINA_TZ: timezone = timezone("Asia/Shanghai")
 
 # 实盘REST API地址
 REST_HOST = "https://api.bybit.com"
@@ -254,9 +265,26 @@ class BybitRestApi(RestClient):
 
     def send_order(self, req: OrderRequest) -> str:
         """委托下单"""
+        # 检查委托类型是否正确
+        if req.type not in ORDER_TYPE_VT2BYBIT:
+            self.gateway.write_log(f"委托失败，不支持的委托类型：{req.type.value}")
+            return
+
+        # 检查合约代码是否正确并根据合约类型判断下单接口
+        if req.symbol in symbols_swap:
+            path: str = "/v2/private/order/create"
+        elif req.symbol in symbols_future:
+            path: str = "/futures/private/order/create"
+        else:
+            self.gateway.write_log(f"委托失败，找不到该合约代码{req.symbol}")
+            return
+
+        # 生成本地委托号
         orderid: str = self.new_orderid()
+        # 推送提交中事件
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
-        
+
+        # 生成委托请求
         data: dict = {
             "symbol": req.symbol,
             "side": DIRECTION_VT2BYBIT[req.direction],
@@ -269,8 +297,6 @@ class BybitRestApi(RestClient):
 
         data["order_type"] = ORDER_TYPE_VT2BYBIT[req.type]
         data["price"] = req.price
-
-        path: str = "/v2/private/order/create"
 
         self.add_request(
             "POST",
@@ -326,6 +352,15 @@ class BybitRestApi(RestClient):
 
     def cancel_order(self, req: CancelRequest) -> None:
         """委托撤单"""
+        # 检查合约代码是否正确并根据合约类型判断撤单接口
+        if req.symbol in symbols_swap:
+            path: str = "/v2/private/order/cancel"
+        elif req.symbol in symbols_future:
+            path: str = "/futures/private/order/cancel"
+        else:
+            self.gateway.write_log(f"撤单失败，找不到该合约代码{req.symbol}")
+            return
+
         data: dict = {"symbol": req.symbol}
 
         # 检查是否为本地委托号
@@ -333,8 +368,6 @@ class BybitRestApi(RestClient):
             data["order_link_id"] = req.orderid
         else:
             data["order_id"] = req.orderid
-
-        path: str = "/v2/private/order/cancel"
 
         self.add_request(
             "POST",
@@ -393,16 +426,16 @@ class BybitRestApi(RestClient):
             return
 
         data = data["result"]
-     
+
         for d in data:
             d = d["data"]
-    
+
             if d["size"]:
                 if d["side"] == "Buy":
                     volume = d["size"]
                 else:
                     volume = -d["size"]
-                
+
                 position: PositionData = PositionData(
                     symbol=d["symbol"],
                     exchange=Exchange.BYBIT,
@@ -432,7 +465,7 @@ class BybitRestApi(RestClient):
                 history_data=True,
                 gateway_name=self.gateway_name
             )
-            
+
             if d["name"] == d["alias"] and d["quote_currency"] != "USDT":
                 symbols_swap.append(d["name"])
                 self.gateway.on_contract(contract)
@@ -459,6 +492,7 @@ class BybitRestApi(RestClient):
                     gateway_name=self.gateway_name,
                 )
                 self.gateway.on_account(account)
+                self.gateway.write_log(f"{key}资金信息查询成功")
 
     def on_query_order(self, data: dict, request: Request):
         """未成交委托查询回报"""
@@ -470,7 +504,9 @@ class BybitRestApi(RestClient):
 
         for d in data["result"]:
             orderid: str = d["order_link_id"]
-            if not orderid:     
+            if orderid:
+                local_orderids.add(orderid)
+            else:
                 orderid: str = d["order_id"]
 
             dt: datetime = generate_datetime(d["created_at"])
@@ -521,9 +557,8 @@ class BybitRestApi(RestClient):
 
     def query_position(self) -> None:
         """查询持仓"""
-
         path_swap: str = "/v2/private/position/list"
-        
+
         self.add_request(
             "GET",
             path_swap,
@@ -617,8 +652,7 @@ class BybitRestApi(RestClient):
 
                 buf: list = []
                 for d in data["result"]:
-                    dt: datetime = datetime.fromtimestamp(d["open_time"])
-                    dt: datetime = LOCAL_TZ.localize(dt)
+                    dt: datetime = generate_datetime_2(d["open_time"])
 
                     bar: BarData = BarData(
                         symbol=req.symbol,
@@ -706,7 +740,7 @@ class BybitPublicWebsocketApi(WebsocketClient):
         tick: TickData = TickData(
             symbol=req.symbol,
             exchange=req.exchange,
-            datetime=datetime.now(UTC_TZ),
+            datetime=datetime.now(),
             name=req.symbol,
             gateway_name=self.gateway_name
         )
@@ -761,7 +795,6 @@ class BybitPublicWebsocketApi(WebsocketClient):
 
         symbol: str = topic.replace("instrument_info.100ms.", "")
         tick: TickData = self.ticks[symbol]
-        # print("on_tick", data)
 
         if type_ == "snapshot":
             if not data["last_price_e4"]:           # 过滤最新价为0的数据
@@ -773,10 +806,8 @@ class BybitPublicWebsocketApi(WebsocketClient):
 
             update: str = data.get("updated_at", None)
             if update:
-                # print("0", symbol, data["updated_at"])
                 tick.datetime = generate_datetime(data["updated_at"])
             else:
-                # print("1", symbol, data["updated_at_e9"])
                 tick.datetime = generate_datetime_2(data["updated_at_e9"] / 1000000000)
         else:
             update: dict = data["update"][0]
@@ -788,13 +819,6 @@ class BybitPublicWebsocketApi(WebsocketClient):
 
             if "volume_24h" in update:
                 tick.volume = update["volume_24h"]
-
-            if "updated_at" in update:
-                # print("2", symbol, update["updated_at"])
-                tick.datetime = generate_datetime(update["updated_at"])
-            else:
-                if "time_to_settle" in update and "settle_time_e9" in update:
-                    tick.datetime = generate_datetime_2((update["settle_time_e9"] / 1000000000) - update["time_to_settle"])
 
         self.gateway.on_tick(copy(tick))
 
@@ -826,8 +850,6 @@ class BybitPublicWebsocketApi(WebsocketClient):
             for d in data["delete"]:
                 price: float = float(d["price"])
                 if d["side"] == "Buy":
-                    #print("BIDS, ",bids)
-                    #print("PRICE, ",price)
                     bids.pop(price)
                 else:
                     asks.pop(price)
@@ -858,8 +880,8 @@ class BybitPublicWebsocketApi(WebsocketClient):
             setattr(tick, f"ask_price_{n}", ask_price)
             setattr(tick, f"ask_volume_{n}", ask_data["size"])
 
-        if tick.datetime:
-            self.gateway.on_tick(copy(tick))
+        tick.datetime = generate_datetime_2(packet["timestamp_e6"] / 1000000)
+        self.gateway.on_tick(copy(tick))
 
 
 class BybitPrivateWebsocketApi(WebsocketClient):
@@ -996,24 +1018,24 @@ class BybitPrivateWebsocketApi(WebsocketClient):
                 datetime=generate_datetime(d["trade_time"]),
                 gateway_name=self.gateway_name,
             )
-              
+
             self.gateway.on_trade(trade)
 
     def on_order(self, packet: dict) -> None:
         """委托更新推送"""
         for d in packet["data"]:
-            order_id: str = d["order_link_id"]
-            if order_id:
-                local_orderids.add(order_id)
+            orderid: str = d["order_link_id"]
+            if orderid:
+                local_orderids.add(orderid)
             else:
-                order_id: str = d["order_id"]
+                orderid: str = d["order_id"]
 
             dt: datetime = generate_datetime(d["timestamp"])
 
             order: OrderData = OrderData(
                 symbol=d["symbol"],
                 exchange=Exchange.BYBIT,
-                orderid=order_id,
+                orderid=orderid,
                 type=ORDER_TYPE_BYBIT2VT[d["order_type"]],
                 direction=DIRECTION_BYBIT2VT[d["side"]],
                 price=float(d["price"]),
@@ -1045,7 +1067,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             self.gateway.on_position(position)
 
             balance: float = get_float_value(d, "wallet_balance")
-            frozen: float = balance - get_float_value(d, "available_balance") 
+            frozen: float = balance - get_float_value(d, "available_balance")
             account: AccountData = AccountData(
                 accountid=d["symbol"].replace("USD", ""),
                 balance=balance,
@@ -1078,13 +1100,15 @@ def generate_datetime(timestamp: str) -> datetime:
         dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ")
     else:
         dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
-    dt: datetime = UTC_TZ.localize(dt)
+    dt: datetime = dt.replace(tzinfo=pytz.utc)
+    dt: datetime = CHINA_TZ.normalize(dt.astimezone(CHINA_TZ))
     return dt
+
 
 def generate_datetime_2(timestamp: int) -> datetime:
     """生成时间"""
     dt: datetime = datetime.fromtimestamp(timestamp)
-    dt: datetime = UTC_TZ.localize(dt)
+    dt: datetime = CHINA_TZ.localize(dt)
     return dt
 
 
