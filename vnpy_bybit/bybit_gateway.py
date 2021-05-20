@@ -504,7 +504,7 @@ class BybitRestApi(RestClient):
         if not data["result"]:
             return
 
-       # 检查是否为本地委托号
+        # 检查是否为本地委托号
         for d in data["result"]:
             orderid: str = d["order_link_id"]
             if orderid:
@@ -1075,7 +1075,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             balance: float = get_float_value(d, "wallet_balance")
             frozen: float = balance - get_float_value(d, "available_balance")
             account: AccountData = AccountData(
-                accountid=d["symbol"].replace("USD", ""),
+                accountid=d["symbol"].split("USD")[0],
                 balance=balance,
                 frozen=frozen,
                 gateway_name=self.gateway_name,
