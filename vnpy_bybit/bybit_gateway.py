@@ -77,11 +77,6 @@ ORDER_TYPE_BYBIT2VT: Dict[str, OrderType] = {v: k for k, v in ORDER_TYPE_VT2BYBI
 DIRECTION_VT2BYBIT: Dict[Direction, str] = {Direction.LONG: "Buy", Direction.SHORT: "Sell"}
 DIRECTION_BYBIT2VT: Dict[str, Direction] = {v: k for k, v in DIRECTION_VT2BYBIT.items()}
 
-OPPOSITE_DIRECTION: Dict[Direction, Direction] = {
-    Direction.LONG: Direction.SHORT,
-    Direction.SHORT: Direction.LONG,
-}
-
 # 数据频率映射
 INTERVAL_VT2BYBIT: Dict[Interval, str] = {
     Interval.MINUTE: "1",
@@ -812,21 +807,27 @@ class BybitPublicWebsocketApi(WebsocketClient):
 
             tick.volume = data["volume_24h"]
 
-            update: str = data.get("updated_at", None)
-            if update:
+            update_time: str = data.get("updated_at", None)
+            if update_time:
                 tick.datetime = generate_datetime(data["updated_at"])
             else:
                 tick.datetime = generate_datetime_2(data["updated_at_e9"] / 1000000000)
         else:
             update: dict = data["update"][0]
 
-            if "last_price_e4" in update:
-                if not update["last_price_e4"]:     # 过滤最新价为0的数据
+            if "last_price_e4" not in update:      # 过滤最新价为0的数据
                     return
-                tick.last_price = update["last_price_e4"] / 10000
+
+            tick.last_price = update["last_price_e4"] / 10000
 
             if "volume_24h" in update:
                 tick.volume = update["volume_24h"]
+
+            update_time: str = update.get("updated_at", None)
+            if update_time:
+                tick.datetime = generate_datetime(update["updated_at"])
+            else:
+                tick.datetime = generate_datetime_2(packet["timestamp_e6"] / 1000000)
 
         self.gateway.on_tick(copy(tick))
 
@@ -857,12 +858,14 @@ class BybitPublicWebsocketApi(WebsocketClient):
         else:
             for d in data["delete"]:
                 price: float = float(d["price"])
+
                 if d["side"] == "Buy":
                     bids.pop(price)
                 else:
                     asks.pop(price)
 
             for d in (data["update"] + data["insert"]):
+
                 price: float = float(d["price"])
                 if d["side"] == "Buy":
                     bids[price] = d
