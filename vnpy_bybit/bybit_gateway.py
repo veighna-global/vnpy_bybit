@@ -736,6 +736,10 @@ class BybitPublicWebsocketApi(WebsocketClient):
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
+
+        if req.symbol in self.subscribed:
+            return
+
         # 缓存订阅记录
         self.subscribed[req.symbol] = req
 
