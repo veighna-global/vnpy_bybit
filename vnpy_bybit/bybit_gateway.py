@@ -816,7 +816,7 @@ class BybitPublicWebsocketApi(WebsocketClient):
             update: dict = data["update"][0]
 
             if "last_price_e4" not in update:      # 过滤最新价为0的数据
-                    return
+                return
 
             tick.last_price = update["last_price_e4"] / 10000
 
