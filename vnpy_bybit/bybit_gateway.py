@@ -394,7 +394,7 @@ class BybitInverseRestApi(RestClient):
         data: dict = request.response.json()
         error_msg: str = data["ret_msg"]
         error_code: int = data["ret_code"]
-        
+
         msg = f"请求失败，状态码：{request.status}，错误代码：{error_code}, 信息：{error_msg}"
         self.gateway.write_log(msg)
 
@@ -1951,10 +1951,9 @@ def generate_datetime(timestamp: str) -> datetime:
         dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ")
     else:
         dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
-        
-    # dt: datetime = dt.replace(tzinfo=utc)
-    # dt: datetime = CHINA_TZ.normalize(dt.astimezone(CHINA_TZ))
-    return CHINA_TZ.localize(dt)
+
+    dt = utc.localize(dt)
+    return dt.astimezone(CHINA_TZ)
 
 
 def generate_datetime_2(timestamp: int) -> datetime:
