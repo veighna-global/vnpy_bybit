@@ -1,4 +1,3 @@
-""""""
 import hashlib
 import hmac
 import sys
@@ -7,10 +6,7 @@ from copy import copy
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Set
 
-import pytz
-from pytz import timezone
-from requests import ConnectionError, Response
-from simplejson.errors import JSONDecodeError
+from pytz import timezone, utc
 from vnpy.event.engine import EventEngine
 from vnpy.trader.constant import (
     Direction,
@@ -37,6 +33,7 @@ from vnpy.trader.object import (
 )
 from vnpy_rest import Request, RestClient
 from vnpy_websocket import WebsocketClient
+
 
 # 中国时区
 CHINA_TZ: timezone = timezone("Asia/Shanghai")
@@ -93,13 +90,13 @@ TIMEDELTA_MAP: Dict[Interval, timedelta] = {
 }
 
 # 反向永续合约类型列表
-symbols_swap: List[str] = []
+swap_symbols: Set[str] = set()
 
 # 反向交割合约类型列表
-symbols_future: List[str] = []
+futures_symbols: Set[str] = set()
 
 # USDT永续合约类型列表
-symbols_usdt: List[str] = []
+usdt_symbols: Set[str] = set()
 
 # 本地委托号缓存集合
 local_orderids: Set[str] = set()
@@ -125,7 +122,9 @@ class BybitGateway(BaseGateway):
         """构造函数"""
         super().__init__(event_engine, gateway_name)
 
-        self.not_connected: bool = True
+        self.rest_api = None
+        self.private_ws_api = None
+        self.public_ws_api = None
 
     def connect(self, setting: dict) -> None:
         """连接交易接口"""
@@ -138,8 +137,6 @@ class BybitGateway(BaseGateway):
             self.rest_api: "BybitInverseRestApi" = BybitInverseRestApi(self)
             self.private_ws_api: "BybitInversePrivateWebsocketApi" = BybitInversePrivateWebsocketApi(self)
             self.public_ws_api: "BybitInversePublicWebsocketApi" = BybitInversePublicWebsocketApi(self)
-
-        self.not_connected = False
 
         key: str = setting["ID"]
         secret: str = setting["Secret"]
@@ -160,7 +157,8 @@ class BybitGateway(BaseGateway):
             proxy_port
         )
         self.private_ws_api.connect(
-            key, secret,
+            key,
+            secret,
             server,
             proxy_host,
             proxy_port
@@ -197,14 +195,14 @@ class BybitGateway(BaseGateway):
 
     def close(self) -> None:
         """关闭连接"""
-        if not self.not_connected:
+        if self.rest_api:
             self.rest_api.stop()
             self.private_ws_api.stop()
             self.public_ws_api.stop()
 
 
 class BybitInverseRestApi(RestClient):
-    """"""
+    """反向合约的REST接口"""
 
     def __init__(self, gateway: BybitGateway) -> None:
         """构造函数"""
@@ -219,7 +217,7 @@ class BybitInverseRestApi(RestClient):
         self.order_count: int = 0
 
     def sign(self, request: Request) -> Request:
-        """ 生成ByBit签名"""
+        """生成签名"""
         request.headers = {"Referer": "vn.py"}
 
         if request.method == "GET":
@@ -235,8 +233,7 @@ class BybitInverseRestApi(RestClient):
         api_params["recv_window"] = 30 * 1000
         api_params["timestamp"] = generate_timestamp(-5)
 
-        data2sign = "&".join(
-            [f"{k}={v}" for k, v in sorted(api_params.items())])
+        data2sign = "&".join([f"{k}={v}" for k, v in sorted(api_params.items())])
         signature: str = sign(self.secret, data2sign.encode())
         api_params["sign"] = signature
 
@@ -260,7 +257,7 @@ class BybitInverseRestApi(RestClient):
         proxy_host: str,
         proxy_port: int,
     ) -> None:
-        """连接REST服务器"""
+        """连接服务器"""
         self.key = key
         self.secret = secret.encode()
 
@@ -282,9 +279,9 @@ class BybitInverseRestApi(RestClient):
             return
 
         # 检查合约代码是否正确并根据合约类型判断下单接口
-        if req.symbol in symbols_swap:
+        if req.symbol in swap_symbols:
             path: str = "/v2/private/order/create"
-        elif req.symbol in symbols_future:
+        elif req.symbol in futures_symbols:
             path: str = "/futures/private/order/create"
         else:
             self.gateway.write_log(f"委托失败，找不到该合约代码{req.symbol}")
@@ -292,6 +289,7 @@ class BybitInverseRestApi(RestClient):
 
         # 生成本地委托号
         orderid: str = self.new_orderid()
+
         # 推送提交中事件
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
 
@@ -359,14 +357,13 @@ class BybitInverseRestApi(RestClient):
             order: OrderData = request.extra
             order.status = Status.REJECTED
             self.gateway.on_order(order)
-            return
 
     def cancel_order(self, req: CancelRequest) -> None:
         """委托撤单"""
         # 检查合约代码是否正确并根据合约类型判断撤单接口
-        if req.symbol in symbols_swap:
+        if req.symbol in swap_symbols:
             path: str = "/v2/private/order/cancel"
-        elif req.symbol in symbols_future:
+        elif req.symbol in futures_symbols:
             path: str = "/futures/private/order/cancel"
         else:
             self.gateway.write_log(f"撤单失败，找不到该合约代码{req.symbol}")
@@ -387,17 +384,6 @@ class BybitInverseRestApi(RestClient):
             callback=self.on_cancel_order
         )
 
-    def on_cancel_order_error(
-        self,
-        exception_type: type,
-        exception_value: Exception,
-        tb,
-        request: Request
-    ) -> None:
-        """委托撤单回报函数报错回报"""
-        if not issubclass(exception_type, ConnectionError):
-            self.on_error(exception_type, exception_value, tb, request)
-
     def on_cancel_order(self, data: dict, request: Request) -> None:
         """委托撤单回报"""
         if self.check_error("委托撤单", data):
@@ -405,15 +391,11 @@ class BybitInverseRestApi(RestClient):
 
     def on_failed(self, status_code: int, request: Request) -> None:
         """处理请求失败回报"""
-        try:
-            data: dict = request.response.json()
-            error_msg: str = data["ret_msg"]
-            error_code: int = data["ret_code"]
-            msg = f"请求失败，状态码：{request.status}，错误代码：{error_code}, 信息：{error_msg}"
-        except JSONDecodeError:
-            text: str = request.response.text
-            msg = f"请求失败，信息：{text}"
-
+        data: dict = request.response.json()
+        error_msg: str = data["ret_msg"]
+        error_code: int = data["ret_code"]
+        
+        msg = f"请求失败，状态码：{request.status}，错误代码：{error_code}, 信息：{error_msg}"
         self.gateway.write_log(msg)
 
     def on_error(
@@ -479,11 +461,11 @@ class BybitInverseRestApi(RestClient):
 
             # 缓存反向永续合约信息并推送
             if d["name"] == d["alias"] and d["quote_currency"] != "USDT":
-                symbols_swap.append(d["name"])
+                swap_symbols.add(d["name"])
                 self.gateway.on_contract(contract)
             # 缓存反向交割合约信息并推送
             elif d["name"] != d["alias"]:
-                symbols_future.append(d["name"])
+                futures_symbols.add(d["name"])
                 self.gateway.on_contract(contract)
 
         self.gateway.write_log("合约信息查询成功")
@@ -515,7 +497,6 @@ class BybitInverseRestApi(RestClient):
         if not data["result"]:
             return
 
-        # 检查是否为本地委托号
         for d in data["result"]:
             orderid: str = d["order_link_id"]
             if orderid:
@@ -587,9 +568,8 @@ class BybitInverseRestApi(RestClient):
 
     def query_order(self) -> None:
         """查询未成交委托"""
-
         path_swap: str = "/v2/private/order"
-        symbols: list = symbols_swap
+        symbols: list = swap_symbols
 
         for symbol in symbols:
             params: dict = {
@@ -604,7 +584,7 @@ class BybitInverseRestApi(RestClient):
             )
 
         path_future: str = "/futures/private/order"
-        symbols: list = symbols_future
+        symbols: list = futures_symbols
 
         for symbol in symbols:
             params: dict = {
@@ -636,7 +616,7 @@ class BybitInverseRestApi(RestClient):
             }
 
             # 从服务器获取响应
-            resp: Response = self.request(
+            resp = self.request(
                 "GET",
                 path,
                 params=params
@@ -698,7 +678,7 @@ class BybitInverseRestApi(RestClient):
 
 
 class BybitInversePublicWebsocketApi(WebsocketClient):
-    """"""
+    """反向合约的行情Websocket接口"""
 
     def __init__(self, gateway: BybitGateway) -> None:
         """构造函数"""
@@ -747,7 +727,6 @@ class BybitInversePublicWebsocketApi(WebsocketClient):
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
-
         if req.symbol in self.subscribed:
             return
 
@@ -860,7 +839,6 @@ class BybitInversePublicWebsocketApi(WebsocketClient):
         asks: dict = self.symbol_asks.setdefault(symbol, {})
 
         if type_ == "snapshot":
-
             buf: list = data
 
             for d in buf:
@@ -911,7 +889,7 @@ class BybitInversePublicWebsocketApi(WebsocketClient):
 
 
 class BybitInversePrivateWebsocketApi(WebsocketClient):
-    """"""
+    """反向合约的交易Websocket接口"""
 
     def __init__(self, gateway: BybitGateway) -> None:
         """构造函数"""
@@ -1010,8 +988,7 @@ class BybitInversePrivateWebsocketApi(WebsocketClient):
         msg = f"触发异常，状态码：{exception_type}，信息：{exception_value}"
         self.gateway.write_log(msg)
 
-        sys.stderr.write(self.exception_detail(
-            exception_type, exception_value, tb))
+        sys.stderr.write(self.exception_detail(exception_type, exception_value, tb))
 
     def on_login(self, packet: dict):
         """用户登录请求回报"""
@@ -1028,7 +1005,6 @@ class BybitInversePrivateWebsocketApi(WebsocketClient):
 
     def on_trade(self, packet: dict) -> None:
         """成交更新推送"""
-        # 检查是否为本地委托号
         for d in packet["data"]:
             orderid: str = d["order_link_id"]
             if not orderid:
@@ -1050,7 +1026,6 @@ class BybitInversePrivateWebsocketApi(WebsocketClient):
 
     def on_order(self, packet: dict) -> None:
         """委托更新推送"""
-        # 检查是否为本地委托号
         for d in packet["data"]:
             orderid: str = d["order_link_id"]
             if orderid:
@@ -1106,7 +1081,7 @@ class BybitInversePrivateWebsocketApi(WebsocketClient):
 
 
 class BybitUsdtRestApi(RestClient):
-    """"""
+    """正向合约的REST接口"""
 
     def __init__(self, gateway: BybitGateway) -> None:
         """构造函数"""
@@ -1121,7 +1096,7 @@ class BybitUsdtRestApi(RestClient):
         self.order_count: int = 0
 
     def sign(self, request: Request) -> Request:
-        """ 生成ByBit签名"""
+        """生成签名"""
         request.headers = {"Referer": "vn.py"}
 
         if request.method == "GET":
@@ -1137,8 +1112,7 @@ class BybitUsdtRestApi(RestClient):
         api_params["recv_window"] = 30 * 1000
         api_params["timestamp"] = generate_timestamp(-5)
 
-        data2sign = "&".join(
-            [f"{k}={v}" for k, v in sorted(api_params.items())])
+        data2sign = "&".join([f"{k}={v}" for k, v in sorted(api_params.items())])
         signature: str = sign(self.secret, data2sign.encode())
         api_params["sign"] = signature
 
@@ -1162,7 +1136,7 @@ class BybitUsdtRestApi(RestClient):
         proxy_host: str,
         proxy_port: int,
     ) -> None:
-        """连接REST服务器"""
+        """连接服务器"""
         self.key = key
         self.secret = secret.encode()
 
@@ -1184,7 +1158,7 @@ class BybitUsdtRestApi(RestClient):
             return
 
         # 检查合约代码是否正确并根据合约类型判断下单接口
-        if req.symbol in symbols_usdt:
+        if req.symbol in usdt_symbols:
             path: str = "/private/linear/order/create"
         else:
             self.gateway.write_log(f"委托失败，找不到该合约代码{req.symbol}")
@@ -1262,12 +1236,11 @@ class BybitUsdtRestApi(RestClient):
             order: OrderData = request.extra
             order.status = Status.REJECTED
             self.gateway.on_order(order)
-            return
 
     def cancel_order(self, req: CancelRequest) -> None:
         """委托撤单"""
         # 检查合约代码是否正确并根据合约类型判断撤单接口
-        if req.symbol in symbols_usdt:
+        if req.symbol in usdt_symbols:
             path: str = "/private/linear/order/cancel"
         else:
             self.gateway.write_log(f"撤单失败，找不到该合约代码{req.symbol}")
@@ -1288,17 +1261,6 @@ class BybitUsdtRestApi(RestClient):
             callback=self.on_cancel_order
         )
 
-    def on_cancel_order_error(
-        self,
-        exception_type: type,
-        exception_value: Exception,
-        tb,
-        request: Request
-    ) -> None:
-        """委托撤单回报函数报错回报"""
-        if not issubclass(exception_type, ConnectionError):
-            self.on_error(exception_type, exception_value, tb, request)
-
     def on_cancel_order(self, data: dict, request: Request) -> None:
         """委托撤单回报"""
         if self.check_error("委托撤单", data):
@@ -1306,15 +1268,11 @@ class BybitUsdtRestApi(RestClient):
 
     def on_failed(self, status_code: int, request: Request) -> None:
         """处理请求失败回报"""
-        try:
-            data: dict = request.response.json()
-            error_msg: str = data["ret_msg"]
-            error_code: int = data["ret_code"]
-            msg = f"请求失败，状态码：{request.status}，错误代码：{error_code}, 信息：{error_msg}"
-        except JSONDecodeError:
-            text: str = request.response.text
-            msg = f"请求失败，信息：{text}"
+        data: dict = request.response.json()
+        error_msg: str = data["ret_msg"]
+        error_code: int = data["ret_code"]
 
+        msg = f"请求失败，状态码：{request.status}，错误代码：{error_code}, 信息：{error_msg}"
         self.gateway.write_log(msg)
 
     def on_error(
@@ -1374,7 +1332,7 @@ class BybitUsdtRestApi(RestClient):
 
             # 缓存正向永续合约信息并推送
             if d["quote_currency"] == "USDT":
-                symbols_usdt.append(d["name"])
+                usdt_symbols.add(d["name"])
                 self.gateway.on_contract(contract)
 
         self.gateway.write_log("合约信息查询成功")
@@ -1406,7 +1364,6 @@ class BybitUsdtRestApi(RestClient):
         if not data["result"]:
             return
 
-        # 检查是否为本地委托号
         for d in data["result"]:
             orderid: str = d["order_link_id"]
             if orderid:
@@ -1477,11 +1434,9 @@ class BybitUsdtRestApi(RestClient):
 
     def query_order(self) -> None:
         """查询未成交委托"""
-
         path_usdt: str = "/private/linear/order/search"
-        symbols: list = symbols_usdt
 
-        for symbol in symbols:
+        for symbol in usdt_symbols:
             params: dict = {
                 "symbol": symbol
             }
@@ -1511,7 +1466,7 @@ class BybitUsdtRestApi(RestClient):
             }
 
             # 从服务器获取响应
-            resp: Response = self.request(
+            resp = self.request(
                 "GET",
                 path,
                 params=params
@@ -1573,7 +1528,7 @@ class BybitUsdtRestApi(RestClient):
 
 
 class BybitUsdtPublicWebsocketApi(WebsocketClient):
-    """"""
+    """正向合约的行情Websocket接口"""
 
     def __init__(self, gateway: BybitGateway) -> None:
         """构造函数"""
@@ -1779,7 +1734,7 @@ class BybitUsdtPublicWebsocketApi(WebsocketClient):
 
 
 class BybitUsdtPrivateWebsocketApi(WebsocketClient):
-    """"""
+    """正向合约的交易Websocket接口"""
 
     def __init__(self, gateway: BybitGateway) -> None:
         """构造函数"""
@@ -1908,7 +1863,6 @@ class BybitUsdtPrivateWebsocketApi(WebsocketClient):
 
     def on_trade(self, packet: dict) -> None:
         """成交更新推送"""
-        # 检查是否为本地委托号
         for d in packet["data"]:
             orderid: str = d["order_link_id"]
             if not orderid:
@@ -1930,7 +1884,6 @@ class BybitUsdtPrivateWebsocketApi(WebsocketClient):
 
     def on_order(self, packet: dict) -> None:
         """委托更新推送"""
-        # 检查是否为本地委托号
         for d in packet["data"]:
             orderid: str = d["order_link_id"]
             if orderid:
@@ -1998,16 +1951,16 @@ def generate_datetime(timestamp: str) -> datetime:
         dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ")
     else:
         dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
-    dt: datetime = dt.replace(tzinfo=pytz.utc)
-    dt: datetime = CHINA_TZ.normalize(dt.astimezone(CHINA_TZ))
-    return dt
+        
+    # dt: datetime = dt.replace(tzinfo=utc)
+    # dt: datetime = CHINA_TZ.normalize(dt.astimezone(CHINA_TZ))
+    return CHINA_TZ.localize(dt)
 
 
 def generate_datetime_2(timestamp: int) -> datetime:
     """生成时间"""
     dt: datetime = datetime.fromtimestamp(timestamp)
-    dt: datetime = CHINA_TZ.localize(dt)
-    return dt
+    return CHINA_TZ.localize(dt)
 
 
 def get_float_value(data: dict, key: str) -> float:
