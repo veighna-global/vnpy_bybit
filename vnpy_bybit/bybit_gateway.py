@@ -798,7 +798,7 @@ class BybitInversePublicWebsocketApi(WebsocketClient):
             if not data["last_price"]:           # 过滤最新价为0的数据
                 return
 
-            tick.last_price = data["last_price"]
+            tick.last_price = float(data["last_price"])
 
             tick.volume = data["volume_24h"]
 
@@ -813,7 +813,7 @@ class BybitInversePublicWebsocketApi(WebsocketClient):
             if "last_price" not in update:      # 过滤最新价为0的数据
                 return
 
-            tick.last_price = update["last_price"]
+            tick.last_price = float(update["last_price"])
 
             tick.volume = update["volume_24h"]
 
@@ -1649,7 +1649,7 @@ class BybitUsdtPublicWebsocketApi(WebsocketClient):
             if not data["last_price"]:           # 过滤最新价为0的数据
                 return
 
-            tick.last_price = int(data["last_price"])
+            tick.last_price = float(data["last_price"])
 
             tick.volume = int(data["volume_24h_e8"]) / 100000000
 
@@ -1661,9 +1661,11 @@ class BybitUsdtPublicWebsocketApi(WebsocketClient):
             if "last_price" not in update:      # 过滤最新价为0的数据
                 return
 
-            tick.last_price = int(update["last_price"])
+            tick.last_price = float(update["last_price"])
 
-            tick.volume = int(update["volume_24h_e8"]) / 100000000
+            if update["volume_24h_e8"]:
+
+                tick.volume = int(update["volume_24h_e8"]) / 100000000
 
             tick.datetime = generate_datetime(update["updated_at"])
 
