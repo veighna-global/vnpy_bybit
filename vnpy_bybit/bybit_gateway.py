@@ -795,10 +795,10 @@ class BybitInversePublicWebsocketApi(WebsocketClient):
         tick: TickData = self.ticks[symbol]
 
         if type_ == "snapshot":
-            if not data["last_price_e4"]:           # 过滤最新价为0的数据
+            if not data["last_price"]:           # 过滤最新价为0的数据
                 return
 
-            tick.last_price = data["last_price_e4"] / 10000
+            tick.last_price = data["last_price"]
 
             tick.volume = data["volume_24h"]
 
@@ -810,10 +810,10 @@ class BybitInversePublicWebsocketApi(WebsocketClient):
         else:
             update: dict = data["update"][0]
 
-            if "last_price_e4" not in update:      # 过滤最新价为0的数据
+            if "last_price" not in update:      # 过滤最新价为0的数据
                 return
 
-            tick.last_price = update["last_price_e4"] / 10000
+            tick.last_price = update["last_price"]
 
             tick.volume = update["volume_24h"]
 
@@ -1646,10 +1646,10 @@ class BybitUsdtPublicWebsocketApi(WebsocketClient):
         tick: TickData = self.ticks[symbol]
 
         if type_ == "snapshot":
-            if not data["last_price_e4"]:           # 过滤最新价为0的数据
+            if not data["last_price"]:           # 过滤最新价为0的数据
                 return
 
-            tick.last_price = int(data["last_price_e4"]) / 10000
+            tick.last_price = int(data["last_price"])
 
             tick.volume = int(data["volume_24h_e8"]) / 100000000
 
@@ -1658,10 +1658,10 @@ class BybitUsdtPublicWebsocketApi(WebsocketClient):
         else:
             update: dict = data["update"][0]
 
-            if "last_price_e4" not in update:      # 过滤最新价为0的数据
+            if "last_price" not in update:      # 过滤最新价为0的数据
                 return
 
-            tick.last_price = int(update["last_price_e4"]) / 10000
+            tick.last_price = int(update["last_price"])
 
             tick.volume = int(update["volume_24h_e8"]) / 100000000
 
@@ -1851,7 +1851,7 @@ class BybitUsdtPrivateWebsocketApi(WebsocketClient):
             self.gateway.write_log("交易Websocket API登录失败")
 
     def on_account(self, packet: dict) -> None:
-        """"""
+        """资金更新推送"""
         for d in packet["data"]:
             account = AccountData(
                 accountid="USDT",
