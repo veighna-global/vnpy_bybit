@@ -24,5 +24,7 @@ import importlib_metadata
 
 from .bybit_gateway import BybitGateway
 
-
-__version__ = importlib_metadata.version("vnpy_bybit")
+try:
+    __version__ = importlib_metadata.version("vnpy_bybit")
+except importlib_metadata.PackageNotFoundError:
+    __version__ = "dev"

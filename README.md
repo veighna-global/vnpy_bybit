@@ -1,11 +1,11 @@
-# vn.py框架的BYBIT底层接口
+# vn.py框架的BYBIT交易接口
 
 <p align="center">
   <img src ="https://vnpy.oss-cn-shanghai.aliyuncs.com/vnpy-logo.png"/>
 </p>
 
 <p align="center">
-    <img src ="https://img.shields.io/badge/version-2021.6.21-blueviolet.svg"/>
+    <img src ="https://img.shields.io/badge/version-2021.10.25-blueviolet.svg"/>
     <img src ="https://img.shields.io/badge/platform-windows|linux|macos-yellow.svg"/>
     <img src ="https://img.shields.io/badge/python-3.7-blue.svg" />
     <img src ="https://img.shields.io/github/license/vnpy/vnpy.svg?color=orange"/>
@@ -13,7 +13,7 @@
 
 ## 说明
 
-基于BYBIT交易所的接口开发，支持永续交易。
+基于BYBIT交易所的接口开发，支持永续合约交易。
 
 ## 安装
 
