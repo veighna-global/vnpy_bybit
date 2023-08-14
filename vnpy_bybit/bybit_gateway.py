@@ -116,6 +116,8 @@ class BybitGateway(BaseGateway):
         "合约模式": ["反向", "正向"]
     }
 
+    default_name: str = "BYBIT"
+
     exchanges: List[Exchange] = [Exchange.BYBIT]
 
     def __init__(self, event_engine: EventEngine, gateway_name: str = "BYBIT") -> None:
@@ -129,14 +131,13 @@ class BybitGateway(BaseGateway):
     def connect(self, setting: dict) -> None:
         """连接交易接口"""
         if setting["合约模式"] == "正向":
-            self.rest_api: "BybitUsdtRestApi" = BybitUsdtRestApi(self)
-            self.private_ws_api: "BybitUsdtPrivateWebsocketApi" = BybitUsdtPrivateWebsocketApi(self)
-            self.public_ws_api: "BybitUsdtPublicWebsocketApi" = BybitUsdtPublicWebsocketApi(self)
-
+            self.rest_api: BybitUsdtRestApi = BybitUsdtRestApi(self)
+            self.private_ws_api: BybitUsdtPrivateWebsocketApi = BybitUsdtPrivateWebsocketApi(self)
+            self.public_ws_api: BybitUsdtPublicWebsocketApi = BybitUsdtPublicWebsocketApi(self)
         else:
-            self.rest_api: "BybitInverseRestApi" = BybitInverseRestApi(self)
-            self.private_ws_api: "BybitInversePrivateWebsocketApi" = BybitInversePrivateWebsocketApi(self)
-            self.public_ws_api: "BybitInversePublicWebsocketApi" = BybitInversePublicWebsocketApi(self)
+            self.rest_api: BybitInverseRestApi = BybitInverseRestApi(self)
+            self.private_ws_api: BybitInversePrivateWebsocketApi = BybitInversePrivateWebsocketApi(self)
+            self.public_ws_api: BybitInversePublicWebsocketApi = BybitInversePublicWebsocketApi(self)
 
         key: str = setting["ID"]
         secret: str = setting["Secret"]
