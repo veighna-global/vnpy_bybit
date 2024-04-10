@@ -4,7 +4,7 @@ import sys
 import time
 from copy import copy
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Set
+from typing import Callable
 
 from pytz import timezone, utc
 from vnpy.event.engine import EventEngine
@@ -55,7 +55,7 @@ TESTNET_PUBLIC_WEBSOCKET_HOST = "wss://stream-testnet.bybit.com/realtime_public"
 TESTNET_PRIVATE_WEBSOCKET_HOST = "wss://stream-testnet.bybit.com/realtime_private"
 
 # 委托状态映射
-STATUS_BYBIT2VT: Dict[str, Status] = {
+STATUS_BYBIT2VT: dict[str, Status] = {
     "Created": Status.NOTTRADED,
     "New": Status.NOTTRADED,
     "PartiallyFilled": Status.PARTTRADED,
@@ -65,24 +65,24 @@ STATUS_BYBIT2VT: Dict[str, Status] = {
 }
 
 # 委托类型映射
-ORDER_TYPE_VT2BYBIT: Dict[OrderType, str] = {
+ORDER_TYPE_VT2BYBIT: dict[OrderType, str] = {
     OrderType.LIMIT: "Limit",
     OrderType.MARKET: "Market",
 }
-ORDER_TYPE_BYBIT2VT: Dict[str, OrderType] = {v: k for k, v in ORDER_TYPE_VT2BYBIT.items()}
+ORDER_TYPE_BYBIT2VT: dict[str, OrderType] = {v: k for k, v in ORDER_TYPE_VT2BYBIT.items()}
 
 # 买卖方向映射
-DIRECTION_VT2BYBIT: Dict[Direction, str] = {Direction.LONG: "Buy", Direction.SHORT: "Sell"}
-DIRECTION_BYBIT2VT: Dict[str, Direction] = {v: k for k, v in DIRECTION_VT2BYBIT.items()}
+DIRECTION_VT2BYBIT: dict[Direction, str] = {Direction.LONG: "Buy", Direction.SHORT: "Sell"}
+DIRECTION_BYBIT2VT: dict[str, Direction] = {v: k for k, v in DIRECTION_VT2BYBIT.items()}
 
 # 数据频率映射
-INTERVAL_VT2BYBIT: Dict[Interval, str] = {
+INTERVAL_VT2BYBIT: dict[Interval, str] = {
     Interval.MINUTE: "1",
     Interval.HOUR: "60",
     Interval.DAILY: "D",
     Interval.WEEKLY: "W",
 }
-TIMEDELTA_MAP: Dict[Interval, timedelta] = {
+TIMEDELTA_MAP: dict[Interval, timedelta] = {
     Interval.MINUTE: timedelta(minutes=1),
     Interval.HOUR: timedelta(hours=1),
     Interval.DAILY: timedelta(days=1),
@@ -90,60 +90,57 @@ TIMEDELTA_MAP: Dict[Interval, timedelta] = {
 }
 
 # 反向永续合约类型列表
-swap_symbols: Set[str] = set()
+swap_symbols: set[str] = set()
 
 # 反向交割合约类型列表
-futures_symbols: Set[str] = set()
+futures_symbols: set[str] = set()
 
 # USDT永续合约类型列表
-usdt_symbols: Set[str] = set()
+usdt_symbols: set[str] = set()
 
 # 本地委托号缓存集合
-local_orderids: Set[str] = set()
+local_orderids: set[str] = set()
 
 
 class BybitGateway(BaseGateway):
     """
-    vn.py用于对接Bybit交易所的交易接口。
+    The Bybit trading gateway for VeighNa.
     """
 
-    default_setting: Dict[str, str] = {
-        "ID": "",
-        "Secret": "",
-        "服务器": ["REAL", "TESTNET"],
-        "代理地址": "",
-        "代理端口": "",
-        "合约模式": ["反向", "正向"]
+    default_name = "BYBIT"
+
+    default_setting: dict[str, str] = {
+        "API Key": "",
+        "Secret Key": "",
+        "Server": ["REAL", "DEMO"],
+        "Proxy Host": "",
+        "Proxy Port": "",
     }
 
     default_name: str = "BYBIT"
 
-    exchanges: List[Exchange] = [Exchange.BYBIT]
+    exchanges: list[Exchange] = [Exchange.BYBIT]
 
-    def __init__(self, event_engine: EventEngine, gateway_name: str = "BYBIT") -> None:
-        """构造函数"""
+    def __init__(self, event_engine: EventEngine, gateway_name: str) -> None:
+        """
+        The init method of the gateway.
+
+        event_engine: the global event engine object of VeighNa
+        gateway_name: the unique name for identifying the gateway
+        """
         super().__init__(event_engine, gateway_name)
 
-        self.rest_api = None
-        self.private_ws_api = None
-        self.public_ws_api = None
+        self.rest_api: BybitRestApi = None
+        self.private_ws_api: BybitPrivateWebsocketApi = None
+        self.public_ws_api: BybitPublicWebsocketApi = None
 
     def connect(self, setting: dict) -> None:
-        """连接交易接口"""
-        if setting["合约模式"] == "正向":
-            self.rest_api: BybitRestApi = BybitRestApi(self)
-            self.private_ws_api: BybitPrivateWebsocketApi = BybitPrivateWebsocketApi(self)
-            self.public_ws_api: BybitPublicWebsocketApi = BybitPublicWebsocketApi(self)
-        else:
-            self.rest_api: BybitInverseRestApi = BybitInverseRestApi(self)
-            self.private_ws_api: BybitInversePrivateWebsocketApi = BybitInversePrivateWebsocketApi(self)
-            self.public_ws_api: BybitInversePublicWebsocketApi = BybitInversePublicWebsocketApi(self)
-
-        key: str = setting["ID"]
-        secret: str = setting["Secret"]
-        server: str = setting["服务器"]
-        proxy_host: str = setting["代理地址"]
-        proxy_port: str = setting["代理端口"]
+        """Start server connections"""
+        key: str = setting["API Key"]
+        secret: str = setting["API Secret"]
+        server: str = setting["Server"]
+        proxy_host: str = setting["Proxy Host"]
+        proxy_port: str = setting["Proxy Port"]
 
         if proxy_port.isdigit():
             proxy_port = int(proxy_port)
@@ -171,35 +168,34 @@ class BybitGateway(BaseGateway):
         )
 
     def subscribe(self, req: SubscribeRequest) -> None:
-        """订阅行情"""
+        """Subscribe market data"""
         self.public_ws_api.subscribe(req)
 
     def send_order(self, req: OrderRequest) -> str:
-        """委托下单"""
+        """Send new order"""
         return self.rest_api.send_order(req)
 
     def cancel_order(self, req: CancelRequest):
-        """委托撤单"""
+        """Cancel existing order"""
         self.rest_api.cancel_order(req)
 
     def query_account(self) -> None:
-        """查询资金"""
+        """Not required since Bybit provides websocket update"""
         pass
 
     def query_position(self) -> None:
-        """查询持仓"""
+        """Not required since Bybit provides websocket update"""
         return
 
-    def query_history(self, req: HistoryRequest) -> List[BarData]:
-        """查询历史数据"""
+    def query_history(self, req: HistoryRequest) -> list[BarData]:
+        """Query kline history data"""
         return self.rest_api.query_history(req)
 
     def close(self) -> None:
-        """关闭连接"""
-        if self.rest_api:
-            self.rest_api.stop()
-            self.private_ws_api.stop()
-            self.public_ws_api.stop()
+        """Close server connections"""
+        self.rest_api.stop()
+        self.private_ws_api.stop()
+        self.public_ws_api.stop()
 
 
 class BybitRestApi(RestClient):
@@ -570,7 +566,7 @@ class BybitRestApi(RestClient):
                 params=params
             )
 
-    def query_history(self, req: HistoryRequest) -> List[BarData]:
+    def query_history(self, req: HistoryRequest) -> list[BarData]:
         """查询历史数据"""
         history: list = []
         count: int = 200
@@ -659,12 +655,12 @@ class BybitPublicWebsocketApi(WebsocketClient):
         self.gateway: BybitGateway = gateway
         self.gateway_name: str = gateway.gateway_name
 
-        self.callbacks: Dict[str, Callable] = {}
-        self.ticks: Dict[str, TickData] = {}
-        self.subscribed: Dict[str, SubscribeRequest] = {}
+        self.callbacks: dict[str, Callable] = {}
+        self.ticks: dict[str, TickData] = {}
+        self.subscribed: dict[str, SubscribeRequest] = {}
 
-        self.symbol_bids: Dict[str, dict] = {}
-        self.symbol_asks: Dict[str, dict] = {}
+        self.symbol_bids: dict[str, dict] = {}
+        self.symbol_asks: dict[str, dict] = {}
 
     def connect(
         self,
@@ -725,7 +721,7 @@ class BybitPublicWebsocketApi(WebsocketClient):
     def subscribe_topic(
         self,
         topic: str,
-        callback: Callable[[str, dict], Any]
+        callback: Callable[[str, dict], object]
     ) -> None:
         """订阅公共频道推送"""
         self.callbacks[topic] = callback
@@ -873,12 +869,12 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         self.secret: bytes = b""
         self.server: str = ""
 
-        self.callbacks: Dict[str, Callable] = {}
-        self.ticks: Dict[str, TickData] = {}
-        self.subscribed: Dict[str, SubscribeRequest] = {}
+        self.callbacks: dict[str, Callable] = {}
+        self.ticks: dict[str, TickData] = {}
+        self.subscribed: dict[str, SubscribeRequest] = {}
 
-        self.symbol_bids: Dict[str, dict] = {}
-        self.symbol_asks: Dict[str, dict] = {}
+        self.symbol_bids: dict[str, dict] = {}
+        self.symbol_asks: dict[str, dict] = {}
 
     def connect(
         self,
@@ -918,7 +914,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
     def subscribe_topic(
         self,
         topic: str,
-        callback: Callable[[str, dict], Any]
+        callback: Callable[[str, dict], object]
     ) -> None:
         """订阅私有频道"""
         self.callbacks[topic] = callback
