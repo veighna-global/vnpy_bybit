@@ -38,21 +38,21 @@ from vnpy_websocket import WebsocketClient
 # 中国时区
 CHINA_TZ: timezone = timezone("Asia/Shanghai")
 
-# 实盘REST API地址
-REST_HOST = "https://api.bybit.com"
+# Mainnet server hosts
+MAINNET_REST_HOST: str = "https://api.bybit.com"
+MAINNET_PRIVATE_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/private"
+MAINNET_SPOT_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/spot"
+MAINNET_LINEAR_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/linear"
+MAINNET_INVERSE_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/inverse"
+MAINNET_OPTION_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/option"
 
-# 实盘Websocket API地址
-INVERSE_WEBSOCKET_HOST = "wss://stream.bybit.com/realtime"
-PUBLIC_WEBSOCKET_HOST = "wss://stream.bybit.com/realtime_public"
-PRIVATE_WEBSOCKET_HOST = "wss://stream.bybit.com/realtime_private"
-
-# 模拟盘REST API地址
-TESTNET_REST_HOST = "https://api-testnet.bybit.com"
-
-# 模拟盘Websocket API地址
-TESTNET_INVERSE_WEBSOCKET_HOST = "wss://stream-testnet.bybit.com/realtime"
-TESTNET_PUBLIC_WEBSOCKET_HOST = "wss://stream-testnet.bybit.com/realtime_public"
-TESTNET_PRIVATE_WEBSOCKET_HOST = "wss://stream-testnet.bybit.com/realtime_private"
+# Testnet server hosts
+TESTNET_REST_HOST: str = "https://api-testnet.bybit.com"
+TESTNET_PRIVATE_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/private"
+TESTNET_SPOT_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/spot"
+TESTNET_LINEAR_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/linear"
+TESTNET_INVERSE_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/inverse"
+TESTNET_OPTION_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/option"
 
 # 委托状态映射
 STATUS_BYBIT2VT: dict[str, Status] = {
@@ -112,7 +112,7 @@ class BybitGateway(BaseGateway):
     default_setting: dict[str, str] = {
         "API Key": "",
         "Secret Key": "",
-        "Server": ["REAL", "DEMO"],
+        "Server": ["MAINNET", "TESTNET"],
         "Proxy Host": "",
         "Proxy Port": "",
     }
@@ -199,10 +199,14 @@ class BybitGateway(BaseGateway):
 
 
 class BybitRestApi(RestClient):
-    """正向合约的REST接口"""
+    """The REST API of BybitGateway"""
 
     def __init__(self, gateway: BybitGateway) -> None:
-        """构造函数"""
+        """
+        The init method of the api.
+
+        gateway: the parent gateway object for pushing callback data.
+        """
         super().__init__()
 
         self.gateway: BybitGateway = gateway
@@ -214,9 +218,7 @@ class BybitRestApi(RestClient):
         self.order_count: int = 0
 
     def sign(self, request: Request) -> Request:
-        """生成签名"""
-        request.headers = {"Referer": "vn.py"}
-
+        """Standard callback for signing a request"""
         if request.method == "GET":
             api_params: dict = request.params
             if api_params is None:
@@ -237,7 +239,7 @@ class BybitRestApi(RestClient):
         return request
 
     def new_orderid(self) -> str:
-        """生成本地委托号"""
+        """Generate local order id"""
         prefix: str = datetime.now().strftime("%Y%m%d-%H%M%S-")
 
         self.order_count += 1
@@ -245,6 +247,17 @@ class BybitRestApi(RestClient):
 
         orderid: str = prefix + suffix
         return orderid
+
+    def check_error(self, name: str, data: dict) -> bool:
+        """回报状态检查"""
+        if data["ret_code"]:
+            error_code: int = data["ret_code"]
+            error_msg: str = data["ret_msg"]
+            msg = f"{name}失败，错误代码：{error_code}，信息：{error_msg}"
+            self.gateway.write_log(msg)
+            return True
+
+        return False
 
     def connect(
         self,
@@ -254,17 +267,17 @@ class BybitRestApi(RestClient):
         proxy_host: str,
         proxy_port: int,
     ) -> None:
-        """连接服务器"""
+        """Start server connection"""
         self.key = key
         self.secret = secret.encode()
 
-        if server == "REAL":
-            self.init(REST_HOST, proxy_host, proxy_port)
+        if server == "MAINNET":
+            self.init(MAINNET_REST_HOST, proxy_host, proxy_port)
         else:
             self.init(TESTNET_REST_HOST, proxy_host, proxy_port)
 
-        self.start(3)
-        self.gateway.write_log("REST API启动成功")
+        self.start()
+        self.gateway.write_log("REST API started")
 
         self.query_contract()
 
@@ -515,40 +528,19 @@ class BybitRestApi(RestClient):
         self.gateway.write_log(f"{order.symbol}委托信息查询成功")
 
     def query_contract(self) -> None:
-        """查询合约信息"""
-        self.add_request(
-            "GET",
-            "/v2/public/symbols",
-            self.on_query_contract
-        )
+        """Query available contract"""
+        for category in ["spot", "linear", "inverse", "option"]:
+            params: dict = {
+                "category": category,
+                "limit": 1000
+            }
 
-    def check_error(self, name: str, data: dict) -> bool:
-        """回报状态检查"""
-        if data["ret_code"]:
-            error_code: int = data["ret_code"]
-            error_msg: str = data["ret_msg"]
-            msg = f"{name}失败，错误代码：{error_code}，信息：{error_msg}"
-            self.gateway.write_log(msg)
-            return True
-
-        return False
-
-    def query_account(self) -> None:
-        """查询资金"""
-        self.add_request(
-            "GET",
-            "/v2/private/wallet/balance",
-            self.on_query_account
-        )
-
-    def query_position(self) -> None:
-        """查询持仓"""
-        path_usdt: str = "/private/linear/position/list"
-        self.add_request(
-            "GET",
-            path_usdt,
-            self.on_query_position
-        )
+            self.add_request(
+                "GET",
+                "/v5/market/instruments-info",
+                self.on_query_contract,
+                params=params
+            )
 
     def query_order(self) -> None:
         """查询未成交委托"""
