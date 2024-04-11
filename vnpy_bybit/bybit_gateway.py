@@ -89,7 +89,10 @@ ORDER_TYPE_VT2BYBIT: dict[OrderType, str] = {
 ORDER_TYPE_BYBIT2VT: dict[str, OrderType] = {v: k for k, v in ORDER_TYPE_VT2BYBIT.items()}
 
 # 买卖方向映射
-DIRECTION_VT2BYBIT: dict[Direction, str] = {Direction.LONG: "Buy", Direction.SHORT: "Sell"}
+DIRECTION_VT2BYBIT: dict[Direction, str] = {
+    Direction.LONG: "Buy",
+    Direction.SHORT: "Sell"
+}
 DIRECTION_BYBIT2VT: dict[str, Direction] = {v: k for k, v in DIRECTION_VT2BYBIT.items()}
 
 # 数据频率映射
@@ -148,7 +151,7 @@ class BybitGateway(BaseGateway):
         super().__init__(event_engine, gateway_name)
 
         self.rest_api: BybitRestApi = BybitRestApi(self)
-        self.private_ws_api: BybitPrivateWebsocketApi = None
+        self.private_ws_api: BybitPrivateWebsocketApi = BybitPrivateWebsocketApi(self)
         self.public_ws_api: BybitPublicWebsocketApi = None
 
     def connect(self, setting: dict) -> None:
@@ -310,6 +313,91 @@ class BybitRestApi(RestClient):
         # self.query_order()
         self.query_time()
 
+    def query_time(self) -> None:
+        """Query server time"""
+        self.add_request(
+            "GET",
+            "/v5/market/time",
+            callback=self.on_query_time
+        )
+
+    def query_contract(self) -> None:
+        """Query available contract"""
+        for category in ["spot", "linear", "inverse", "option"]:
+            params: dict = {
+                "category": category,
+                "limit": 1000
+            }
+
+            self.add_request(
+                "GET",
+                "/v5/market/instruments-info",
+                self.on_query_contract,
+                params=params
+            )
+
+    def query_order(self) -> None:
+        """Query open orders"""
+        for category in ["spot", "linear", "inverse", "option"]:
+            params: dict = {"category": category}
+
+            if category == "linear":
+                for coin in ["USDT", "USDC"]:
+                    params["settleCoin"] = coin
+                
+                    self.add_request(
+                        "GET",
+                        "/v5/order/realtime",
+                        self.on_query_order,
+                        params=params
+                    )
+            else:
+                self.add_request(
+                    "GET",
+                    "/v5/order/realtime",
+                    self.on_query_order,
+                    params=params
+                )
+
+    def query_account(self) -> None:
+        """Query account balance"""
+        for account_type in ["UNIFIED", "CONTRACT"]:
+            params: dict = {"accountType": account_type}
+
+            self.add_request(
+                "GET",
+                "/v5/account/wallet-balance",
+                self.on_query_account,
+                params=params
+            )
+
+    def query_position(self) -> None:
+        """Query holding positions"""
+        for category in ["linear", "inverse", "option"]:
+            params: dict = {
+                "category": category,
+                "limit": 200
+            }
+
+
+            if category == "linear":
+                for coin in ["USDT", "USDC"]:
+                    params["settleCoin"] = coin
+                
+                    self.add_request(
+                        "GET",
+                        "/v5/position/list",
+                        self.on_query_position,
+                        params=params
+                    )
+            else:
+                self.add_request(
+                    "GET",
+                    "/v5/position/list",
+                    self.on_query_position,
+                    params=params
+                )
+
     def send_order(self, req: OrderRequest) -> str:
         """委托下单"""
         # 检查委托类型是否正确
@@ -450,27 +538,6 @@ class BybitRestApi(RestClient):
             self.exception_detail(exception_type, exception_value, tb, request)
         )
 
-    def on_query_position(self, data: dict, request: Request) -> None:
-        """持仓查询回报"""
-        if self.check_error("查询持仓", data):
-            return
-
-        data = data["result"]
-
-        for d in data:
-            d = d["data"]
-
-            if d["size"]:
-                position: PositionData = PositionData(
-                    symbol=d["symbol"],
-                    exchange=Exchange.BYBIT,
-                    direction=DIRECTION_BYBIT2VT[d["side"]],
-                    volume=d["size"],
-                    price=d["entry_price"],
-                    gateway_name=self.gateway_name
-                )
-                self.gateway.on_position(position)
-
     def on_query_time(self, packet: dict, request: Request) -> None:
         """Callback of server time query"""
         result: dict = packet["result"]
@@ -481,7 +548,9 @@ class BybitRestApi(RestClient):
 
         self.gateway.write_log(f"Server time updated, local offset: {self.time_offset} ms")
 
-        self.query_order()
+        # self.query_order()
+        self.query_account()
+        self.query_position()
 
     def on_query_contract(self, data: dict, request: Request) -> None:
         """Callback of available contracts query"""
@@ -526,24 +595,8 @@ class BybitRestApi(RestClient):
         # self.query_account()
         # self.query_order()
 
-    def on_query_account(self, data: dict, request: Request) -> None:
-        """资金查询回报"""
-        if self.check_error("查询账号", data):
-            return
-
-        for key, value in data["result"].items():
-            if key == "USDT":
-                account: AccountData = AccountData(
-                    accountid=key,
-                    balance=value["wallet_balance"],
-                    frozen=value["used_margin"],
-                    gateway_name=self.gateway_name,
-                )
-                self.gateway.on_account(account)
-                self.gateway.write_log(f"{key}资金信息查询成功")
-
     def on_query_order(self, data: dict, request: Request):
-        """未成交委托查询回报"""
+        """Callback of open orders query"""
         if data["retCode"]:
             msg = f"Query open orders failed, code: {data['retCode']}, message: {data['retMsg']}"
             self.gateway.write_log(msg)
@@ -577,51 +630,43 @@ class BybitRestApi(RestClient):
 
         self.gateway.write_log(f"{category} open orders data is received")
 
-    def query_time(self) -> None:
-        """Query server time"""
-        self.add_request(
-            "GET",
-            "/v5/market/time",
-            callback=self.on_query_time
-        )
+    def on_query_account(self, data: dict, request: Request) -> None:
+        """Callback of account balance query"""
+        if data["retCode"]:
+            msg = f"Query account balance failed, code: {data['retCode']}, message: {data['retMsg']}"
+            self.gateway.write_log(msg)
+            return
+        
+        result: dict = data["result"]
 
-    def query_contract(self) -> None:
-        """Query available contract"""
-        for category in ["spot", "linear", "inverse", "option"]:
-            params: dict = {
-                "category": category,
-                "limit": 1000
-            }
-
-            self.add_request(
-                "GET",
-                "/v5/market/instruments-info",
-                self.on_query_contract,
-                params=params
+        for d in result["list"]:
+            account: AccountData = AccountData(
+                accountid=d["accountType"],
+                balance=float(d["totalWalletBalance"]),
+                frozen=float(d["totalWalletBalance"]) - float(d["totalAvailableBalance"]),
+                gateway_name=self.gateway_name,
             )
+            self.gateway.on_account(account)
 
-    def query_order(self) -> None:
-        """查询未成交委托"""
-        for category in ["spot", "linear", "inverse", "option"]:
-            params: dict = {"category": category}
+    def on_query_position(self, data: dict, request: Request) -> None:
+        """Callback of holding positions query"""
+        if data["retCode"]:
+            msg = f"Query holding position failed, code: {data['retCode']}, message: {data['retMsg']}"
+            self.gateway.write_log(msg)
+            return
+        
+        result: dict = data["result"]
 
-            if category == "linear":
-                for coin in ["USDT", "USDC"]:
-                    params["settleCoin"] = coin
-                
-                    self.add_request(
-                        "GET",
-                        "/v5/order/realtime",
-                        self.on_query_order,
-                        params=params
-                    )
-            else:
-                self.add_request(
-                    "GET",
-                    "/v5/order/realtime",
-                    self.on_query_order,
-                    params=params
-                )
+        for d in result["list"]:
+            position: PositionData = PositionData(
+                symbol=d["symbol"],
+                exchange=Exchange.BYBIT,
+                direction=DIRECTION_BYBIT2VT[d["side"]],
+                volume=float(d["size"]),
+                price=float(d["avgPrice"]),
+                gateway_name=self.gateway_name
+            )
+            self.gateway.on_position(position)
 
     def query_history(self, req: HistoryRequest) -> list[BarData]:
         """查询历史数据"""
@@ -923,7 +968,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         self.gateway_name: str = gateway.gateway_name
 
         self.key: str = ""
-        self.secret: bytes = b""
+        self.secret: str = ""
         self.server: str = ""
 
         self.callbacks: dict[str, Callable] = {}
@@ -943,13 +988,13 @@ class BybitPrivateWebsocketApi(WebsocketClient):
     ) -> None:
         """连接Websocket私有频道"""
         self.key = key
-        self.secret = secret.encode()
+        self.secret = secret
         self.proxy_host = proxy_host
         self.proxy_port = proxy_port
         self.server = server
 
         if self.server == "REAL":
-            url = PRIVATE_WEBSOCKET_HOST
+            url = REAL_PRIVATE_WEBSOCKET_HOST
         else:
             url = DEMO_PRIVATE_WEBSOCKET_HOST
 
@@ -958,9 +1003,12 @@ class BybitPrivateWebsocketApi(WebsocketClient):
 
     def login(self) -> None:
         """用户登录"""
-        expires: int = generate_timestamp(30)
-        msg = f"GET/realtime{int(expires)}"
-        signature: str = sign(self.secret, msg.encode())
+        expires: int = int((time.time() + 30) * 1000)
+
+        signature = str(hmac.new(
+            bytes(self.secret, "utf-8"),
+            bytes(f"GET/realtime{expires}", "utf-8"), digestmod="sha256"
+        ).hexdigest())
 
         req: dict = {
             "op": "auth",
@@ -984,7 +1032,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
 
     def on_connected(self) -> None:
         """连接成功回报"""
-        self.gateway.write_log("交易Websocket API连接成功")
+        self.gateway.write_log("Private websocket stream is connected")
         self.login()
 
     def on_disconnected(self) -> None:
@@ -993,8 +1041,9 @@ class BybitPrivateWebsocketApi(WebsocketClient):
 
     def on_packet(self, packet: dict) -> None:
         """推送数据回报"""
+        print(packet)
         if "topic" not in packet:
-            op: str = packet["request"]["op"]
+            op: str = packet["op"]
             if op == "auth":
                 self.on_login(packet)
         else:
@@ -1019,7 +1068,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         """用户登录请求回报"""
         success: bool = packet.get("success", False)
         if success:
-            self.gateway.write_log("交易Websocket API登录成功")
+            self.gateway.write_log("Private websocket stream login successful")
 
             self.subscribe_topic("order", self.on_order)
             self.subscribe_topic("execution", self.on_trade)
@@ -1027,7 +1076,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             self.subscribe_topic("wallet", self.on_account)
 
         else:
-            self.gateway.write_log("交易Websocket API登录失败")
+            self.gateway.write_log(f"Private websocket stream login failed: {packet['ret_msg']}")
 
     def on_account(self, packet: dict) -> None:
         """资金更新推送"""
@@ -1107,13 +1156,8 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             self.gateway.on_position(position)
 
 
-def generate_timestamp(expire_after: float = 30) -> int:
-    """生成时间戳"""
-    return int(time.time() * 1000 + expire_after * 1000)
-
-
 def generate_signature(secret: str, param_str: str) -> str:
-    """生成签名"""
+    """Generate signature for REST API"""
     hash: hmac.HMAC = hmac.new(
         bytes(secret, "utf-8"),
         param_str.encode("utf-8"),
@@ -1122,35 +1166,11 @@ def generate_signature(secret: str, param_str: str) -> str:
     return hash.hexdigest()
 
 
-def generate_datetime(timestamp: str) -> datetime:
-    """生成时间"""
-    if "." in timestamp:
-        part1, part2 = timestamp.split(".")
-        if len(part2) > 7:
-            part2 = part2[:6] + "Z"
-            timestamp = ".".join([part1, part2])
-
-        dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%S.%fZ")
-    else:
-        dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
-
-    dt = utc.localize(dt)
-    return dt.astimezone(BYBIT_TZ)
-
-
 def generate_datetime(timestamp: int) -> datetime:
-    """生成时间"""
+    """Generate datetime object from timestamp"""
     dt: datetime = datetime.fromtimestamp(timestamp / 1000)
     return dt.replace(tzinfo=BYBIT_TZ)
-
-
-def get_float_value(data: dict, key: str) -> float:
-    """获取字典中对应键的浮点数值"""
-    data_str: str = data.get(key, "")
-    if not data_str:
-        return 0.0
-    return float(data_str)
-
+ 
 
 def prepare_payload(method: str, parameters: dict) -> str:
     """
