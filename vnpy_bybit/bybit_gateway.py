@@ -71,7 +71,7 @@ OPTION_TYPE_BYBIT2VT: dict[str, OptionType] = {
     "Put": OptionType.PUT
 }
 
-# 委托状态映射
+# Order status map
 STATUS_BYBIT2VT: dict[str, Status] = {
     "Created": Status.NOTTRADED,
     "New": Status.NOTTRADED,
@@ -112,9 +112,6 @@ TIMEDELTA_MAP: dict[Interval, timedelta] = {
 
 # Global data storage
 symbol_category_map: dict[str, str] = {}
-
-# 本地委托号缓存集合
-local_orderids: set[str] = set()
 
 
 class BybitGateway(BaseGateway):
@@ -260,7 +257,7 @@ class BybitRestApi(RestClient):
             "X-BAPI-TIMESTAMP": str(timestamp),
             "X-BAPI-RECV-WINDOW": str(recv_window),
         }
-        
+
         if request.method != "GET":
             request.data = req_params
 
@@ -340,7 +337,7 @@ class BybitRestApi(RestClient):
             if category == "linear":
                 for coin in ["USDT", "USDC"]:
                     params["settleCoin"] = coin
-                
+
                     self.add_request(
                         "GET",
                         "/v5/order/realtime",
@@ -375,11 +372,10 @@ class BybitRestApi(RestClient):
                 "limit": 200
             }
 
-
             if category == "linear":
                 for coin in ["USDT", "USDC"]:
                     params["settleCoin"] = coin
-                
+
                     self.add_request(
                         "GET",
                         "/v5/position/list",
@@ -658,7 +654,7 @@ class BybitRestApi(RestClient):
             msg = f"Query account balance failed, code: {data['retCode']}, message: {data['retMsg']}"
             self.gateway.write_log(msg)
             return
-        
+
         result: dict = data["result"]
 
         for d in result["list"]:
@@ -676,7 +672,7 @@ class BybitRestApi(RestClient):
             msg = f"Query holding position failed, code: {data['retCode']}, message: {data['retMsg']}"
             self.gateway.write_log(msg)
             return
-        
+
         result: dict = data["result"]
 
         for d in result["list"]:
@@ -1142,7 +1138,7 @@ def generate_datetime(timestamp: int) -> datetime:
     """Generate datetime object from timestamp"""
     dt: datetime = datetime.fromtimestamp(timestamp / 1000)
     return dt.replace(tzinfo=BYBIT_TZ)
- 
+
 
 def prepare_payload(method: str, parameters: dict) -> str:
     """
@@ -1160,10 +1156,10 @@ def prepare_payload(method: str, parameters: dict) -> str:
         integer_params = ["positionIdx"]
         for key, value in parameters.items():
             if key in string_params:
-                if type(value) != str:
+                if not isinstance(value, str):
                     parameters[key] = str(value)
             elif key in integer_params:
-                if type(value) != int:
+                if not isinstance(value, int):
                     parameters[key] = int(value)
 
     if method == "GET":
