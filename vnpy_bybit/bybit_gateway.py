@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import sys
 import time
+import json
 from copy import copy
 from datetime import datetime, timedelta
 from typing import Callable
@@ -229,28 +230,38 @@ class BybitRestApi(RestClient):
         self.gateway_name: str = gateway.gateway_name
 
         self.key: str = ""
-        self.secret: bytes = b""
+        self.secret: str = ""
 
+        self.time_offset: int = 0
         self.order_count: int = 0
 
     def sign(self, request: Request) -> Request:
         """Standard callback for signing a request"""
-        if request.method == "GET":
-            api_params: dict = request.params
-            if api_params is None:
-                api_params = request.params = {}
-        else:
-            api_params: dict = request.data
-            if api_params is None:
-                api_params = request.data = {}
+        # Prepare payload
+        parameters: dict = {}
+        if request.params:
+            parameters = request.params
+        elif request.data:
+            parameters = request.data
 
-        api_params["api_key"] = self.key
-        api_params["recv_window"] = 30 * 1000
-        api_params["timestamp"] = generate_timestamp(-5)
+        req_params: str = prepare_payload(request.method, parameters)
 
-        data2sign = "&".join([f"{k}={v}" for k, v in sorted(api_params.items())])
-        signature: str = sign(self.secret, data2sign.encode())
-        api_params["sign"] = signature
+        # Generate signature
+        timestamp: int = int(time.time() * 1000) - self.time_offset
+        recv_window: int = 30_000
+
+        param_str: str = str(timestamp) + self.key + str(recv_window) + req_params
+        signature: str = generate_signature(self.secret, param_str)
+
+        # Add headers
+        request.headers = {
+            "Content-Type": "application/json",
+            "X-BAPI-API-KEY": self.key,
+            "X-BAPI-SIGN": signature,
+            "X-BAPI-SIGN-TYPE": "2",
+            "X-BAPI-TIMESTAMP": str(timestamp),
+            "X-BAPI-RECV-WINDOW": str(recv_window),
+        }
 
         return request
 
@@ -285,7 +296,7 @@ class BybitRestApi(RestClient):
     ) -> None:
         """Start server connection"""
         self.key = key
-        self.secret = secret.encode()
+        self.secret = secret
 
         if server == "MAINNET":
             self.init(MAINNET_REST_HOST, proxy_host, proxy_port)
@@ -295,7 +306,9 @@ class BybitRestApi(RestClient):
         self.start()
         self.gateway.write_log("REST API started")
 
-        self.query_contract()
+        # self.query_contract()
+        # self.query_order()
+        self.query_time()
 
     def send_order(self, req: OrderRequest) -> str:
         """委托下单"""
@@ -458,6 +471,18 @@ class BybitRestApi(RestClient):
                 )
                 self.gateway.on_position(position)
 
+    def on_query_time(self, packet: dict, request: Request) -> None:
+        """Callback of server time query"""
+        result: dict = packet["result"]
+
+        local_time: float = int(time.time() * 1000)
+        server_time: float = int(int(result["timeNano"]) / 1_000_000)
+        self.time_offset = local_time - server_time
+
+        self.gateway.write_log(f"Server time updated, local offset: {self.time_offset} ms")
+
+        self.query_order()
+
     def on_query_contract(self, data: dict, request: Request) -> None:
         """Callback of available contracts query"""
         result: dict = data["result"]
@@ -519,13 +544,15 @@ class BybitRestApi(RestClient):
 
     def on_query_order(self, data: dict, request: Request):
         """未成交委托查询回报"""
-        if self.check_error("查询委托", data):
+        if data["retCode"]:
+            msg = f"Query open orders failed, code: {data['retCode']}, message: {data['retMsg']}"
+            self.gateway.write_log(msg)
             return
 
-        if not data["result"]:
-            return
+        result: dict = data["result"]
+        category: str = result["category"]
 
-        for d in data["result"]:
+        for d in result["list"]:
             orderid: str = d["order_link_id"]
             if orderid:
                 local_orderids.add(orderid)
@@ -555,7 +582,15 @@ class BybitRestApi(RestClient):
 
             self.gateway.on_order(order)
 
-        self.gateway.write_log(f"{order.symbol}委托信息查询成功")
+        self.gateway.write_log(f"{category} open orders data is received")
+
+    def query_time(self) -> None:
+        """Query server time"""
+        self.add_request(
+            "GET",
+            "/v5/market/time",
+            callback=self.on_query_time
+        )
 
     def query_contract(self) -> None:
         """Query available contract"""
@@ -574,19 +609,26 @@ class BybitRestApi(RestClient):
 
     def query_order(self) -> None:
         """查询未成交委托"""
-        path_usdt: str = "/private/linear/order/search"
+        for category in ["spot", "linear", "inverse", "option"]:
+            params: dict = {"category": category}
 
-        for symbol in usdt_symbols:
-            params: dict = {
-                "symbol": symbol
-            }
-
-            self.add_request(
-                "GET",
-                path_usdt,
-                callback=self.on_query_order,
-                params=params
-            )
+            if category == "linear":
+                for coin in ["USDT", "USDC"]:
+                    params["settleCoin"] = coin
+                
+                    self.add_request(
+                        "GET",
+                        "/v5/order/realtime",
+                        self.on_query_order,
+                        params=params
+                    )
+            else:
+                self.add_request(
+                    "GET",
+                    "/v5/order/realtime",
+                    self.on_query_order,
+                    params=params
+                )
 
     def query_history(self, req: HistoryRequest) -> list[BarData]:
         """查询历史数据"""
@@ -1077,11 +1119,14 @@ def generate_timestamp(expire_after: float = 30) -> int:
     return int(time.time() * 1000 + expire_after * 1000)
 
 
-def sign(secret: bytes, data: bytes) -> str:
+def generate_signature(secret: str, param_str: str) -> str:
     """生成签名"""
-    return hmac.new(
-        secret, data, digestmod=hashlib.sha256
-    ).hexdigest()
+    hash: hmac.HMAC = hmac.new(
+        bytes(secret, "utf-8"),
+        param_str.encode("utf-8"),
+        hashlib.sha256,
+    )
+    return hash.hexdigest()
 
 
 def generate_datetime(timestamp: str) -> datetime:
@@ -1112,3 +1157,39 @@ def get_float_value(data: dict, key: str) -> float:
     if not data_str:
         return 0.0
     return float(data_str)
+
+
+def prepare_payload(method: str, parameters: dict) -> str:
+    """
+    Prepares the request payload and validates parameter value types.
+    """
+
+    def cast_values():
+        string_params = [
+            "qty",
+            "price",
+            "triggerPrice",
+            "takeProfit",
+            "stopLoss",
+        ]
+        integer_params = ["positionIdx"]
+        for key, value in parameters.items():
+            if key in string_params:
+                if type(value) != str:
+                    parameters[key] = str(value)
+            elif key in integer_params:
+                if type(value) != int:
+                    parameters[key] = int(value)
+
+    if method == "GET":
+        payload = "&".join(
+            [
+                str(k) + "=" + str(v)
+                for k, v in sorted(parameters.items())
+                if v is not None
+            ]
+        )
+        return payload
+    else:
+        cast_values()
+        return json.dumps(parameters)
