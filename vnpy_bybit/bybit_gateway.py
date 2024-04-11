@@ -7,18 +7,19 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 from pytz import timezone, utc
-from vnpy.event.engine import EventEngine
-from vnpy.trader.constant import (
+from vnpy_evo.event import EventEngine
+from vnpy_evo.trader.constant import (
     Direction,
     Exchange,
     Interval,
     OrderType,
     Product,
     Status,
-    Offset
+    Offset,
+    OptionType
 )
-from vnpy.trader.gateway import BaseGateway
-from vnpy.trader.object import (
+from vnpy_evo.trader.gateway import BaseGateway
+from vnpy_evo.trader.object import (
     AccountData,
     BarData,
     CancelRequest,
@@ -53,6 +54,21 @@ TESTNET_SPOT_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/spo
 TESTNET_LINEAR_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/linear"
 TESTNET_INVERSE_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/inverse"
 TESTNET_OPTION_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/option"
+
+
+# Product type map
+PRODUCT_BYBIT2VT: dict[str, Exchange] = {
+    "spot": Product.SPOT,
+    "linear": Product.SWAP,
+    "inverse": Product.SWAP,
+    "option": Product.OPTION,
+}
+
+# Option type map
+OPTION_TYPE_BYBIT2VT: dict[str, OptionType] = {
+    "Call": OptionType.CALL,
+    "Put": OptionType.PUT
+}
 
 # 委托状态映射
 STATUS_BYBIT2VT: dict[str, Status] = {
@@ -130,14 +146,14 @@ class BybitGateway(BaseGateway):
         """
         super().__init__(event_engine, gateway_name)
 
-        self.rest_api: BybitRestApi = None
+        self.rest_api: BybitRestApi = BybitRestApi(self)
         self.private_ws_api: BybitPrivateWebsocketApi = None
         self.public_ws_api: BybitPublicWebsocketApi = None
 
     def connect(self, setting: dict) -> None:
         """Start server connections"""
         key: str = setting["API Key"]
-        secret: str = setting["API Secret"]
+        secret: str = setting["Secret Key"]
         server: str = setting["Server"]
         proxy_host: str = setting["Proxy Host"]
         proxy_port: str = setting["Proxy Port"]
@@ -154,18 +170,18 @@ class BybitGateway(BaseGateway):
             proxy_host,
             proxy_port
         )
-        self.private_ws_api.connect(
-            key,
-            secret,
-            server,
-            proxy_host,
-            proxy_port
-        )
-        self.public_ws_api.connect(
-            server,
-            proxy_host,
-            proxy_port
-        )
+        # self.private_ws_api.connect(
+        #     key,
+        #     secret,
+        #     server,
+        #     proxy_host,
+        #     proxy_port
+        # )
+        # self.public_ws_api.connect(
+        #     server,
+        #     proxy_host,
+        #     proxy_port
+        # )
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """Subscribe market data"""
@@ -194,8 +210,8 @@ class BybitGateway(BaseGateway):
     def close(self) -> None:
         """Close server connections"""
         self.rest_api.stop()
-        self.private_ws_api.stop()
-        self.public_ws_api.stop()
+        # self.private_ws_api.stop()
+        # self.public_ws_api.stop()
 
 
 class BybitRestApi(RestClient):
@@ -443,33 +459,47 @@ class BybitRestApi(RestClient):
                 self.gateway.on_position(position)
 
     def on_query_contract(self, data: dict, request: Request) -> None:
-        """合约查询回报"""
-        if self.check_error("查询合约", data):
-            return
+        """Callback of available contracts query"""
+        result: dict = data["result"]
 
-        for d in data["result"]:
-            # 提取信息生成合约对象
+        category: str = result["category"]
+        product: Product = PRODUCT_BYBIT2VT[category]
+
+        for d in result["list"]:
             contract: ContractData = ContractData(
-                symbol=d["name"],
+                symbol=d["symbol"],
                 exchange=Exchange.BYBIT,
-                name=d["name"],
-                product=Product.FUTURES,
+                name=d["symbol"],
+                product=product,
                 size=1,
-                pricetick=float(d["price_filter"]["tick_size"]),
-                min_volume=d["lot_size_filter"]["min_trading_qty"],
+                pricetick=float(d["priceFilter"]["tickSize"]),
+                min_volume=float(d["lotSizeFilter"]["minOrderQty"]),
                 history_data=True,
                 gateway_name=self.gateway_name
             )
 
-            # 缓存正向永续合约信息并推送
-            if d["quote_currency"] == "USDT":
-                usdt_symbols.add(d["name"])
-                self.gateway.on_contract(contract)
+            # If symbol contains digit, then should be futures
+            if product == Product.SWAP and not contract.symbol.isalpha():
+                contract.product = Product.FUTURES
 
-        self.gateway.write_log("合约信息查询成功")
-        self.query_position()
-        self.query_account()
-        self.query_order()
+            # Add extra option field
+            if product == Product.OPTION:
+                buf: list = contract.symbol.split("-")
+
+                contract.option_strike = int(buf[2])
+                contract.option_underlying = "-".join(buf[:2])
+                contract.option_type = OPTION_TYPE_BYBIT2VT[d["optionsType"]]
+                contract.option_listed = generate_datetime_2(float(d["launchTime"]) / 1000)
+                contract.option_expiry = generate_datetime_2(float(d["deliveryTime"]) / 1000)
+                contract.option_portfolio = buf[0]
+                contract.option_index = str(contract.option_strike)
+
+            self.gateway.on_contract(contract)
+
+        self.gateway.write_log(f"Available {category} contracts data is received")
+        # self.query_position()
+        # self.query_account()
+        # self.query_order()
 
     def on_query_account(self, data: dict, request: Request) -> None:
         """资金查询回报"""
