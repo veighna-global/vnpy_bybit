@@ -81,21 +81,21 @@ STATUS_BYBIT2VT: dict[str, Status] = {
     "Rejected": Status.REJECTED,
 }
 
-# 委托类型映射
+# Order type map
 ORDER_TYPE_VT2BYBIT: dict[OrderType, str] = {
     OrderType.LIMIT: "Limit",
     OrderType.MARKET: "Market",
 }
 ORDER_TYPE_BYBIT2VT: dict[str, OrderType] = {v: k for k, v in ORDER_TYPE_VT2BYBIT.items()}
 
-# 买卖方向映射
+# Direction map
 DIRECTION_VT2BYBIT: dict[Direction, str] = {
     Direction.LONG: "Buy",
     Direction.SHORT: "Sell"
 }
 DIRECTION_BYBIT2VT: dict[str, Direction] = {v: k for k, v in DIRECTION_VT2BYBIT.items()}
 
-# 数据频率映射
+# Interval map
 INTERVAL_VT2BYBIT: dict[Interval, str] = {
     Interval.MINUTE: "1",
     Interval.HOUR: "60",
@@ -109,14 +109,9 @@ TIMEDELTA_MAP: dict[Interval, timedelta] = {
     Interval.WEEKLY: timedelta(days=7),
 }
 
-# 反向永续合约类型列表
-swap_symbols: set[str] = set()
 
-# 反向交割合约类型列表
-futures_symbols: set[str] = set()
-
-# USDT永续合约类型列表
-usdt_symbols: set[str] = set()
+# Global data storage
+symbol_category_map: dict[str, str] = {}
 
 # 本地委托号缓存集合
 local_orderids: set[str] = set()
@@ -265,6 +260,9 @@ class BybitRestApi(RestClient):
             "X-BAPI-TIMESTAMP": str(timestamp),
             "X-BAPI-RECV-WINDOW": str(recv_window),
         }
+        
+        if request.method != "GET":
+            request.data = req_params
 
         return request
 
@@ -309,8 +307,6 @@ class BybitRestApi(RestClient):
         self.start()
         self.gateway.write_log("REST API started")
 
-        # self.query_contract()
-        # self.query_order()
         self.query_time()
 
     def query_time(self) -> None:
@@ -399,120 +395,142 @@ class BybitRestApi(RestClient):
                 )
 
     def send_order(self, req: OrderRequest) -> str:
-        """委托下单"""
-        # 检查委托类型是否正确
-        if req.type not in ORDER_TYPE_VT2BYBIT:
-            self.gateway.write_log(f"委托失败，不支持的委托类型：{req.type.value}")
-            return
-
-        # 检查合约代码是否正确并根据合约类型判断下单接口
-        if req.symbol in usdt_symbols:
-            path: str = "/private/linear/order/create"
-        else:
-            self.gateway.write_log(f"委托失败，找不到该合约代码{req.symbol}")
-            return
-
-        # 生成本地委托号
+        """Send new order"""
+        # Generate new order id
         orderid: str = self.new_orderid()
-        # 推送提交中事件
-        order: OrderData = req.create_order_data(orderid, self.gateway_name)
 
-        # 生成委托请求
+        # Push a submitting order event
+        order: OrderData = req.create_order_data(orderid, self.gateway_name)
+        self.gateway.on_order(order)
+
+        # Create order parameters
         data: dict = {
+            "category": symbol_category_map.get(req.symbol, ""),
             "symbol": req.symbol,
+            "orderType": ORDER_TYPE_VT2BYBIT[req.type],
             "side": DIRECTION_VT2BYBIT[req.direction],
-            "qty": req.volume,
-            "order_link_id": orderid,
-            "time_in_force": "GoodTillCancel",
-            "reduce_only": False,
-            "close_on_trigger": False
+            "qty": str(req.volume),
+            "price": str(req.price),
+            "orderLinkId": orderid
         }
 
-        data["order_type"] = ORDER_TYPE_VT2BYBIT[req.type]
-        data["price"] = req.price
-
         if req.offset == Offset.CLOSE:
-            data["reduce_only"] = True
+            data["reduceOnly"] = True
 
+        # Send request
         self.add_request(
             "POST",
-            path,
-            callback=self.on_send_order,
+            "/v5/order/create",
             data=data,
             extra=order,
+            callback=self.on_send_order,
             on_failed=self.on_send_order_failed,
             on_error=self.on_send_order_error,
         )
 
-        self.gateway.on_order(order)
         return order.vt_orderid
-
-    def on_send_order_failed(
-        self,
-        status_code: int,
-        request: Request
-    ) -> None:
-        """委托下单失败服务器报错回报"""
-        order: OrderData = request.extra
-        order.status = Status.REJECTED
-        self.gateway.on_order(order)
-
-        data: dict = request.response.json()
-        error_msg: str = data["ret_msg"]
-        error_code: int = data["ret_code"]
-        msg = f"委托失败，错误代码:{error_code},  错误信息：{error_msg}"
-        self.gateway.write_log(msg)
-
-    def on_send_order_error(
-        self,
-        exception_type: type,
-        exception_value: Exception,
-        tb,
-        request: Request
-    ) -> None:
-        """委托下单回报函数报错回报"""
-        order: OrderData = request.extra
-        order.status = Status.REJECTED
-        self.gateway.on_order(order)
-
-        if not issubclass(exception_type, ConnectionError):
-            self.on_error(exception_type, exception_value, tb, request)
-
-    def on_send_order(self, data: dict, request: Request) -> None:
-        """委托下单回报"""
-        if self.check_error("委托下单", data):
-            order: OrderData = request.extra
-            order.status = Status.REJECTED
-            self.gateway.on_order(order)
 
     def cancel_order(self, req: CancelRequest) -> None:
         """委托撤单"""
-        # 检查合约代码是否正确并根据合约类型判断撤单接口
-        if req.symbol in usdt_symbols:
-            path: str = "/private/linear/order/cancel"
+        # Create cancel parameters
+        data: dict = {
+            "category": symbol_category_map.get(req.symbol, ""),
+            "symbol": req.symbol
+        }
+
+        # Use dash count to check order id type
+        dash_count = req.orderid.count("-")
+
+        if dash_count == 4:
+            data["orderId"] = req.orderid
         else:
-            self.gateway.write_log(f"撤单失败，找不到该合约代码{req.symbol}")
-            return
+            data["orderLinkId"] = req.orderid
 
-        data: dict = {"symbol": req.symbol}
-
-        # 检查是否为本地委托号
-        if req.orderid in local_orderids:
-            data["order_link_id"] = req.orderid
-        else:
-            data["order_id"] = req.orderid
-
+        # Send cancel request
         self.add_request(
             "POST",
-            path,
+            "/v5/order/cancel",
             data=data,
             callback=self.on_cancel_order
         )
 
-    def on_cancel_order(self, data: dict, request: Request) -> None:
-        """委托撤单回报"""
-        if self.check_error("委托撤单", data):
-            return
+    def query_history(self, req: HistoryRequest) -> list[BarData]:
+        """查询历史数据"""
+        history: list = []
+        count: int = 200
+        start_time: int = int(req.start.timestamp())
+
+        path: str = "/public/linear/kline"
+
+        while True:
+            # 创建查询参数
+            params: dict = {
+                "symbol": req.symbol,
+                "interval": INTERVAL_VT2BYBIT[req.interval],
+                "from": start_time,
+                "limit": count
+            }
+
+            # 从服务器获取响应
+            resp = self.request(
+                "GET",
+                path,
+                params=params
+            )
+
+            # 如果请求失败则终止循环
+            if resp.status_code // 100 != 2:
+                msg = f"获取历史数据失败，状态码：{resp.status_code}，信息：{resp.text}"
+                self.gateway.write_log(msg)
+                break
+            else:
+                data: dict = resp.json()
+
+                ret_code: int = data["ret_code"]
+                if ret_code:
+                    ret_msg: str = data["ret_msg"]
+                    msg = f"获取历史数据出错，错误信息：{ret_msg}"
+                    self.gateway.write_log(msg)
+                    break
+
+                if not data["result"]:
+                    msg = f"获取历史数据为空，开始时间：{start_time}，数量：{count}"
+                    self.gateway.write_log(msg)
+                    break
+
+                buf: list = []
+                for d in data["result"]:
+                    dt: datetime = generate_datetime_2(d["open_time"])
+
+                    bar: BarData = BarData(
+                        symbol=req.symbol,
+                        exchange=req.exchange,
+                        datetime=dt,
+                        interval=req.interval,
+                        volume=float(d["volume"]),
+                        open_price=float(d["open"]),
+                        high_price=float(d["high"]),
+                        low_price=float(d["low"]),
+                        close_price=float(d["close"]),
+                        gateway_name=self.gateway_name
+                    )
+                    buf.append(bar)
+
+                history.extend(buf)
+
+                begin: datetime = buf[0].datetime
+                end: datetime = buf[-1].datetime
+                msg = f"获取历史数据成功，{req.symbol} - {req.interval.value}，{begin} - {end}"
+                self.gateway.write_log(msg)
+
+                # 收到最后数据则结束循环
+                if len(buf) < count:
+                    break
+
+                # 更新开始时间
+                start_time: int = int((bar.datetime + TIMEDELTA_MAP[req.interval]).timestamp())
+
+        return history
 
     def on_failed(self, status_code: int, request: Request) -> None:
         """处理请求失败回报"""
@@ -548,7 +566,8 @@ class BybitRestApi(RestClient):
 
         self.gateway.write_log(f"Server time updated, local offset: {self.time_offset} ms")
 
-        # self.query_order()
+        self.query_contract()
+        self.query_order()
         self.query_account()
         self.query_position()
 
@@ -583,10 +602,12 @@ class BybitRestApi(RestClient):
                 contract.option_strike = int(buf[2])
                 contract.option_underlying = "-".join(buf[:2])
                 contract.option_type = OPTION_TYPE_BYBIT2VT[d["optionsType"]]
-                contract.option_listed = generate_datetime_2(float(d["launchTime"]) / 1000)
-                contract.option_expiry = generate_datetime_2(float(d["deliveryTime"]) / 1000)
+                contract.option_listed = generate_datetime(float(d["launchTime"]))
+                contract.option_expiry = generate_datetime(float(d["deliveryTime"]))
                 contract.option_portfolio = buf[0]
                 contract.option_index = str(contract.option_strike)
+
+            symbol_category_map[contract.symbol] = category
 
             self.gateway.on_contract(contract)
 
@@ -668,83 +689,41 @@ class BybitRestApi(RestClient):
             )
             self.gateway.on_position(position)
 
-    def query_history(self, req: HistoryRequest) -> list[BarData]:
-        """查询历史数据"""
-        history: list = []
-        count: int = 200
-        start_time: int = int(req.start.timestamp())
+    def on_send_order_failed(self, status_code: int, request: Request) -> None:
+        """Failed callback of send_order"""
+        order: OrderData = request.extra
+        order.status = Status.REJECTED
+        self.gateway.on_order(order)
 
-        path: str = "/public/linear/kline"
+        msg = f"Send order failed, code: {status_code}"
+        self.gateway.write_log(msg)
 
-        while True:
-            # 创建查询参数
-            params: dict = {
-                "symbol": req.symbol,
-                "interval": INTERVAL_VT2BYBIT[req.interval],
-                "from": start_time,
-                "limit": count
-            }
+    def on_send_order_error(self, exception_type: type, exception_value: Exception, tb, request: Request) -> None:
+        """Error callback of send_order"""
+        order: OrderData = request.extra
+        order.status = Status.REJECTED
+        self.gateway.on_order(order)
 
-            # 从服务器获取响应
-            resp = self.request(
-                "GET",
-                path,
-                params=params
-            )
+        msg: str = f"Send order error, exception type: {exception_type}, exception value: {exception_value}"
+        self.gateway.write_log(msg)
 
-            # 如果请求失败则终止循环
-            if resp.status_code // 100 != 2:
-                msg = f"获取历史数据失败，状态码：{resp.status_code}，信息：{resp.text}"
-                self.gateway.write_log(msg)
-                break
-            else:
-                data: dict = resp.json()
+        self.on_error(exception_type, exception_value, tb, request)
 
-                ret_code: int = data["ret_code"]
-                if ret_code:
-                    ret_msg: str = data["ret_msg"]
-                    msg = f"获取历史数据出错，错误信息：{ret_msg}"
-                    self.gateway.write_log(msg)
-                    break
+    def on_send_order(self, data: dict, request: Request) -> None:
+        """Successful callback of send_order"""
+        if data["retCode"]:
+            msg = f"Send order failed, code: {data['retCode']}, message: {data['retMsg']}"
+            self.gateway.write_log(msg)
 
-                if not data["result"]:
-                    msg = f"获取历史数据为空，开始时间：{start_time}，数量：{count}"
-                    self.gateway.write_log(msg)
-                    break
+            order: OrderData = request.extra
+            order.status = Status.REJECTED
+            self.gateway.on_order(order)
 
-                buf: list = []
-                for d in data["result"]:
-                    dt: datetime = generate_datetime_2(d["open_time"])
-
-                    bar: BarData = BarData(
-                        symbol=req.symbol,
-                        exchange=req.exchange,
-                        datetime=dt,
-                        interval=req.interval,
-                        volume=float(d["volume"]),
-                        open_price=float(d["open"]),
-                        high_price=float(d["high"]),
-                        low_price=float(d["low"]),
-                        close_price=float(d["close"]),
-                        gateway_name=self.gateway_name
-                    )
-                    buf.append(bar)
-
-                history.extend(buf)
-
-                begin: datetime = buf[0].datetime
-                end: datetime = buf[-1].datetime
-                msg = f"获取历史数据成功，{req.symbol} - {req.interval.value}，{begin} - {end}"
-                self.gateway.write_log(msg)
-
-                # 收到最后数据则结束循环
-                if len(buf) < count:
-                    break
-
-                # 更新开始时间
-                start_time: int = int((bar.datetime + TIMEDELTA_MAP[req.interval]).timestamp())
-
-        return history
+    def on_cancel_order(self, data: dict, request: Request) -> None:
+        """委托撤单回报"""
+        if data["retCode"]:
+            msg = f"Cancel order failed, code: {data['retCode']}, message: {data['retMsg']}"
+            self.gateway.write_log(msg)
 
 
 class BybitPublicWebsocketApi(WebsocketClient):
@@ -855,8 +834,7 @@ class BybitPublicWebsocketApi(WebsocketClient):
         msg = f"触发异常，状态码：{exception_type}，信息：{exception_value}"
         self.gateway.write_log(msg)
 
-        sys.stderr.write(self.exception_detail(
-            exception_type, exception_value, tb))
+        sys.stderr.write(self.exception_detail(exception_type, exception_value, tb))
 
     def on_tick(self, packet: dict) -> None:
         """行情推送回报"""
