@@ -147,7 +147,7 @@ class BybitGateway(BaseGateway):
 
         self.rest_api: BybitRestApi = BybitRestApi(self)
         self.private_ws_api: BybitPrivateWebsocketApi = BybitPrivateWebsocketApi(self)
-        self.public_ws_api: BybitPublicWebsocketApi = None
+        self.public_ws_api: BybitPublicWebsocketApi = BybitPublicWebsocketApi(self)
 
     def connect(self, setting: dict) -> None:
         """Start server connections"""
@@ -169,13 +169,13 @@ class BybitGateway(BaseGateway):
             proxy_host,
             proxy_port
         )
-        # self.private_ws_api.connect(
-        #     key,
-        #     secret,
-        #     server,
-        #     proxy_host,
-        #     proxy_port
-        # )
+        self.private_ws_api.connect(
+            key,
+            secret,
+            server,
+            proxy_host,
+            proxy_port
+        )
         # self.public_ws_api.connect(
         #     server,
         #     proxy_host,
@@ -588,6 +588,7 @@ class BybitRestApi(RestClient):
                 pricetick=float(d["priceFilter"]["tickSize"]),
                 min_volume=float(d["lotSizeFilter"]["minOrderQty"]),
                 history_data=True,
+                net_position=True,
                 gateway_name=self.gateway_name
             )
 
@@ -679,11 +680,17 @@ class BybitRestApi(RestClient):
         result: dict = data["result"]
 
         for d in result["list"]:
+            volume: float = 0
+            if d["side"] == "Buy":
+                volume = float(d["size"])
+            elif d["side"] == "Sell":
+                volume = -float(d["size"])
+
             position: PositionData = PositionData(
                 symbol=d["symbol"],
                 exchange=Exchange.BYBIT,
-                direction=DIRECTION_BYBIT2VT[d["side"]],
-                volume=float(d["size"]),
+                direction=Direction.NET,
+                volume=volume,
                 price=float(d["avgPrice"]),
                 gateway_name=self.gateway_name
             )
@@ -936,10 +943,14 @@ class BybitPublicWebsocketApi(WebsocketClient):
 
 
 class BybitPrivateWebsocketApi(WebsocketClient):
-    """正向合约的交易Websocket接口"""
+    """The private websocket API of BybitGateway"""
 
     def __init__(self, gateway: BybitGateway) -> None:
-        """构造函数"""
+        """
+        The init method of the api.
+
+        gateway: the parent gateway object for pushing callback data.
+        """
         super().__init__()
 
         self.gateway: BybitGateway = gateway
@@ -950,11 +961,6 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         self.server: str = ""
 
         self.callbacks: dict[str, Callable] = {}
-        self.ticks: dict[str, TickData] = {}
-        self.subscribed: dict[str, SubscribeRequest] = {}
-
-        self.symbol_bids: dict[str, dict] = {}
-        self.symbol_asks: dict[str, dict] = {}
 
     def connect(
         self,
@@ -964,7 +970,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         proxy_host: str,
         proxy_port: int
     ) -> None:
-        """连接Websocket私有频道"""
+        """Start server connection"""
         self.key = key
         self.secret = secret
         self.proxy_host = proxy_host
@@ -980,10 +986,10 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         self.start()
 
     def login(self) -> None:
-        """用户登录"""
+        """User login"""
         expires: int = int((time.time() + 30) * 1000)
 
-        signature = str(hmac.new(
+        signature: str = str(hmac.new(
             bytes(self.secret, "utf-8"),
             bytes(f"GET/realtime{expires}", "utf-8"), digestmod="sha256"
         ).hexdigest())
@@ -999,7 +1005,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         topic: str,
         callback: Callable[[str, dict], object]
     ) -> None:
-        """订阅私有频道"""
+        """Subscribe websocket stream topic"""
         self.callbacks[topic] = callback
 
         req: dict = {
@@ -1009,17 +1015,16 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         self.send_packet(req)
 
     def on_connected(self) -> None:
-        """连接成功回报"""
+        """Callback when server is connected"""
         self.gateway.write_log("Private websocket stream is connected")
         self.login()
 
     def on_disconnected(self) -> None:
-        """连接断开回报"""
-        self.gateway.write_log("交易Websocket API连接断开")
+        """Callback when server is disconnected"""
+        self.gateway.write_log("Private websocket stream is disconnected")
 
     def on_packet(self, packet: dict) -> None:
-        """推送数据回报"""
-        print(packet)
+        """Callback of data update"""
         if "topic" not in packet:
             op: str = packet["op"]
             if op == "auth":
@@ -1029,21 +1034,17 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             callback: callable = self.callbacks[channel]
             callback(packet)
 
-    def on_error(
-        self,
-        exception_type: type,
-        exception_value: Exception,
-        tb
-    ) -> None:
-        """触发异常回报"""
-        msg = f"触发异常，状态码：{exception_type}，信息：{exception_value}"
+    def on_error(self, exception_type: type, exception_value: Exception, tb) -> None:
+        """General error callback"""
+        detail: str = self.exception_detail(exception_type, exception_value, tb)
+
+        msg: str = f"Exception catched by private websocket API: {detail}"
         self.gateway.write_log(msg)
 
-        sys.stderr.write(self.exception_detail(
-            exception_type, exception_value, tb))
+        print(detail)
 
     def on_login(self, packet: dict):
-        """用户登录请求回报"""
+        """Callback of user login"""
         success: bool = packet.get("success", False)
         if success:
             self.gateway.write_log("Private websocket stream login successful")
@@ -1052,68 +1053,55 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             self.subscribe_topic("execution", self.on_trade)
             self.subscribe_topic("position", self.on_position)
             self.subscribe_topic("wallet", self.on_account)
-
         else:
             self.gateway.write_log(f"Private websocket stream login failed: {packet['ret_msg']}")
 
     def on_account(self, packet: dict) -> None:
-        """资金更新推送"""
+        """Callback of account balance update"""
         for d in packet["data"]:
             account = AccountData(
-                accountid="USDT",
-                balance=d["wallet_balance"],
-                frozen=d["wallet_balance"] - d["available_balance"],
+                accountid=d["accountType"],
+                balance=float(d["totalWalletBalance"]),
+                frozen=(float(d["totalWalletBalance"]) - float(d["totalAvailableBalance"])),
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_account(account)
 
     def on_trade(self, packet: dict) -> None:
-        """成交更新推送"""
+        """Callback of trade update"""
         for d in packet["data"]:
-            orderid: str = d["order_link_id"]
-            if not orderid:
-                orderid: str = d["order_id"]
-
             trade: TradeData = TradeData(
                 symbol=d["symbol"],
                 exchange=Exchange.BYBIT,
-                orderid=orderid,
-                tradeid=d["exec_id"],
+                orderid=d["orderLinkId"],
+                tradeid=d["execId"],
                 direction=DIRECTION_BYBIT2VT[d["side"]],
-                price=float(d["price"]),
-                volume=d["exec_qty"],
-                datetime=generate_datetime(d["trade_time"]),
+                price=float(d["execPrice"]),
+                volume=float(d["execQty"]),
+                datetime=generate_datetime(int(d["execTime"])),
                 gateway_name=self.gateway_name,
             )
 
             self.gateway.on_trade(trade)
 
     def on_order(self, packet: dict) -> None:
-        """委托更新推送"""
+        """Callback of order update"""
         for d in packet["data"]:
-            orderid: str = d["order_link_id"]
-            if orderid:
-                local_orderids.add(orderid)
-            else:
-                orderid: str = d["order_id"]
-
-            dt: datetime = generate_datetime(d["create_time"])
-
             order: OrderData = OrderData(
                 symbol=d["symbol"],
                 exchange=Exchange.BYBIT,
-                orderid=orderid,
-                type=ORDER_TYPE_BYBIT2VT[d["order_type"]],
+                orderid=d["orderLinkId"],
+                type=ORDER_TYPE_BYBIT2VT[d["orderType"]],
                 direction=DIRECTION_BYBIT2VT[d["side"]],
                 price=float(d["price"]),
-                volume=d["qty"],
-                traded=d["cum_exec_qty"],
-                status=STATUS_BYBIT2VT[d["order_status"]],
-                datetime=dt,
+                volume=float(d["qty"]),
+                traded=float(d["cumExecQty"]),
+                status=STATUS_BYBIT2VT[d["orderStatus"]],
+                datetime=generate_datetime(int(d["createdTime"])),
                 gateway_name=self.gateway_name
             )
-            offset: bool = d["reduce_only"]
-            if offset:
+
+            if d["reduceOnly"]:
                 order.offset = Offset.CLOSE
             else:
                 order.offset = Offset.OPEN
@@ -1121,14 +1109,20 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             self.gateway.on_order(order)
 
     def on_position(self, packet: dict) -> None:
-        """持仓更新推送"""
+        """Callback of holding position update"""
         for d in packet["data"]:
+            volume: float = 0
+            if d["side"] == "Buy":
+                volume = float(d["size"])
+            elif d["side"] == "Sell":
+                volume = -float(d["size"])
+
             position: PositionData = PositionData(
                 symbol=d["symbol"],
                 exchange=Exchange.BYBIT,
-                direction=DIRECTION_BYBIT2VT[d["side"]],
-                volume=d["size"],
-                price=float(d["entry_price"]),
+                direction=Direction.NET,
+                volume=volume,
+                price=float(d["entryPrice"]),
                 gateway_name=self.gateway_name
             )
             self.gateway.on_position(position)
