@@ -6,8 +6,8 @@ import json
 from copy import copy
 from datetime import datetime, timedelta
 from typing import Callable
+from zoneinfo import ZoneInfo
 
-from pytz import timezone, utc
 from vnpy_evo.event import EventEngine
 from vnpy_evo.trader.constant import (
     Direction,
@@ -37,24 +37,24 @@ from vnpy_rest import Request, RestClient
 from vnpy_websocket import WebsocketClient
 
 
-# 中国时区
-CHINA_TZ: timezone = timezone("Asia/Shanghai")
+# Timezone
+BYBIT_TZ: ZoneInfo = ZoneInfo("Asia/Shanghai")
 
 # Mainnet server hosts
-MAINNET_REST_HOST: str = "https://api.bybit.com"
-MAINNET_PRIVATE_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/private"
-MAINNET_SPOT_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/spot"
-MAINNET_LINEAR_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/linear"
-MAINNET_INVERSE_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/inverse"
-MAINNET_OPTION_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/option"
+REAL_REST_HOST: str = "https://api.bybit.com"
+REAL_PRIVATE_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/private"
+REAL_SPOT_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/spot"
+REAL_LINEAR_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/linear"
+REAL_INVERSE_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/inverse"
+REAL_OPTION_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/option"
 
 # Testnet server hosts
-TESTNET_REST_HOST: str = "https://api-testnet.bybit.com"
-TESTNET_PRIVATE_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/private"
-TESTNET_SPOT_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/spot"
-TESTNET_LINEAR_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/linear"
-TESTNET_INVERSE_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/inverse"
-TESTNET_OPTION_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/option"
+DEMO_REST_HOST: str = "https://api-demo.bybit.com"
+DEMO_PRIVATE_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/private"
+DEMO_SPOT_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/public/spot"
+DEMO_LINEAR_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/public/linear"
+DEMO_INVERSE_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/public/inverse"
+DEMO_OPTION_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/public/option"
 
 
 # Product type map
@@ -129,7 +129,7 @@ class BybitGateway(BaseGateway):
     default_setting: dict[str, str] = {
         "API Key": "",
         "Secret Key": "",
-        "Server": ["MAINNET", "TESTNET"],
+        "Server": ["REAL", "DEMO"],
         "Proxy Host": "",
         "Proxy Port": "",
     }
@@ -298,10 +298,10 @@ class BybitRestApi(RestClient):
         self.key = key
         self.secret = secret
 
-        if server == "MAINNET":
-            self.init(MAINNET_REST_HOST, proxy_host, proxy_port)
+        if server == "REAL":
+            self.init(REAL_REST_HOST, proxy_host, proxy_port)
         else:
-            self.init(TESTNET_REST_HOST, proxy_host, proxy_port)
+            self.init(DEMO_REST_HOST, proxy_host, proxy_port)
 
         self.start()
         self.gateway.write_log("REST API started")
@@ -553,28 +553,21 @@ class BybitRestApi(RestClient):
         category: str = result["category"]
 
         for d in result["list"]:
-            orderid: str = d["order_link_id"]
-            if orderid:
-                local_orderids.add(orderid)
-            else:
-                orderid: str = d["order_id"]
-
-            dt: datetime = generate_datetime(d["created_time"])
-
             order: OrderData = OrderData(
                 symbol=d["symbol"],
                 exchange=Exchange.BYBIT,
-                orderid=orderid,
-                type=ORDER_TYPE_BYBIT2VT[d["order_type"]],
+                orderid=d["orderLinkId"],
+                type=ORDER_TYPE_BYBIT2VT[d["orderType"]],
                 direction=DIRECTION_BYBIT2VT[d["side"]],
-                price=d["price"],
-                volume=d["qty"],
-                traded=d["cum_exec_qty"],
-                status=STATUS_BYBIT2VT[d["order_status"]],
-                datetime=dt,
+                price=float(d["price"]),
+                volume=float(d["qty"]),
+                traded=float(d["cumExecQty"]),
+                status=STATUS_BYBIT2VT[d["orderStatus"]],
+                datetime=generate_datetime(int(d["createdTime"])),
                 gateway_name=self.gateway_name
             )
-            offset: bool = d["reduce_only"]
+
+            offset: bool = d["reduceOnly"]
             if offset:
                 order.offset = Offset.CLOSE
             else:
@@ -740,7 +733,7 @@ class BybitPublicWebsocketApi(WebsocketClient):
         if self.server == "REAL":
             url = PUBLIC_WEBSOCKET_HOST
         else:
-            url = TESTNET_PUBLIC_WEBSOCKET_HOST
+            url = DEMO_PUBLIC_WEBSOCKET_HOST
 
         self.init(url, self.proxy_host, self.proxy_port)
         self.start()
@@ -958,7 +951,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         if self.server == "REAL":
             url = PRIVATE_WEBSOCKET_HOST
         else:
-            url = TESTNET_PRIVATE_WEBSOCKET_HOST
+            url = DEMO_PRIVATE_WEBSOCKET_HOST
 
         self.init(url, self.proxy_host, self.proxy_port)
         self.start()
@@ -1142,13 +1135,13 @@ def generate_datetime(timestamp: str) -> datetime:
         dt: datetime = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
 
     dt = utc.localize(dt)
-    return dt.astimezone(CHINA_TZ)
+    return dt.astimezone(BYBIT_TZ)
 
 
-def generate_datetime_2(timestamp: int) -> datetime:
+def generate_datetime(timestamp: int) -> datetime:
     """生成时间"""
-    dt: datetime = datetime.fromtimestamp(timestamp)
-    return CHINA_TZ.localize(dt)
+    dt: datetime = datetime.fromtimestamp(timestamp / 1000)
+    return dt.replace(tzinfo=BYBIT_TZ)
 
 
 def get_float_value(data: dict, key: str) -> float:
