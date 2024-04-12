@@ -461,81 +461,86 @@ class BybitRestApi(RestClient):
         )
 
     def query_history(self, req: HistoryRequest) -> list[BarData]:
-        """查询历史数据"""
-        history: list = []
-        count: int = 200
-        start_time: int = int(req.start.timestamp())
+        """Query kline history data"""
+        count: int = 1000
+        start_time: int = int(req.start.timestamp()) * 1000
+        category: str = symbol_category_map.get(req.symbol, "")
 
-        path: str = "/public/linear/kline"
+        buf: dict[datetime, BarData] = {}
+        last_end_dt: datetime = None
 
         while True:
-            # 创建查询参数
+            # Create query params
             params: dict = {
+                "category": category,
                 "symbol": req.symbol,
                 "interval": INTERVAL_VT2BYBIT[req.interval],
-                "from": start_time,
+                "start": start_time,
                 "limit": count
             }
 
-            # 从服务器获取响应
+            # Get response from server
             resp = self.request(
                 "GET",
-                path,
+                "/v5/market/kline",
                 params=params
             )
 
-            # 如果请求失败则终止循环
+            # Break loop if request is failed
             if resp.status_code // 100 != 2:
-                msg = f"获取历史数据失败，状态码：{resp.status_code}，信息：{resp.text}"
+                msg = f"Query kline history failed, status code: {resp.status_code}, message: {resp.text}"
                 self.gateway.write_log(msg)
                 break
             else:
-                data: dict = resp.json()
+                packet: dict = resp.json()
+                result: dict = packet["result"]
+                kline_data: list = result["list"]
 
-                ret_code: int = data["ret_code"]
-                if ret_code:
-                    ret_msg: str = data["ret_msg"]
-                    msg = f"获取历史数据出错，错误信息：{ret_msg}"
+                if not kline_data:
+                    msg = f"No kline history data is received, start time: {start_time}, count: {count}"
                     self.gateway.write_log(msg)
                     break
 
-                if not data["result"]:
-                    msg = f"获取历史数据为空，开始时间：{start_time}，数量：{count}"
-                    self.gateway.write_log(msg)
-                    break
-
-                buf: list = []
-                for d in data["result"]:
-                    dt: datetime = generate_datetime_2(d["open_time"])
+                for row in kline_data:
+                    dt: datetime = generate_datetime(int(row[0]))
 
                     bar: BarData = BarData(
                         symbol=req.symbol,
                         exchange=req.exchange,
                         datetime=dt,
                         interval=req.interval,
-                        volume=float(d["volume"]),
-                        open_price=float(d["open"]),
-                        high_price=float(d["high"]),
-                        low_price=float(d["low"]),
-                        close_price=float(d["close"]),
+                        volume=float(row[5]),
+                        turnover=float(row[6]),
+                        open_price=float(row[1]),
+                        high_price=float(row[2]),
+                        low_price=float(row[3]),
+                        close_price=float(row[4]),
                         gateway_name=self.gateway_name
                     )
-                    buf.append(bar)
+                    buf[bar.datetime] = bar
 
-                history.extend(buf)
+                begin: str = kline_data[-1][0]
+                begin_dt = generate_datetime(int(begin))
 
-                begin: datetime = buf[0].datetime
-                end: datetime = buf[-1].datetime
-                msg = f"获取历史数据成功，{req.symbol} - {req.interval.value}，{begin} - {end}"
-                self.gateway.write_log(msg)
+                end: datetime = kline_data[0][0]
+                end_dt = generate_datetime(int(end))
 
-                # 收到最后数据则结束循环
-                if len(buf) < count:
+                # Break loop if all data received
+                if end_dt == last_end_dt:
                     break
+                last_end_dt = end_dt
 
-                # 更新开始时间
-                start_time: int = int((bar.datetime + TIMEDELTA_MAP[req.interval]).timestamp())
+                msg: str = f"Query kline history finished, {req.symbol} - {req.interval.value}, {begin_dt} - {end_dt}"
+                self.gateway.write_log(msg)
+                print(msg)
 
+                # Update start time
+                start_time: int = end
+
+        index: list[datetime] = list(buf.keys())
+        index.sort()
+
+        history: list[BarData] = [buf[i] for i in index]
         return history
 
     def on_failed(self, status_code: int, request: Request) -> None:
