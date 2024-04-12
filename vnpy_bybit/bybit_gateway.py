@@ -57,7 +57,6 @@ DEMO_LINEAR_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/public/linear"
 DEMO_INVERSE_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/public/inverse"
 DEMO_OPTION_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/public/option"
 
-
 # Product type map
 PRODUCT_BYBIT2VT: dict[str, Exchange] = {
     "spot": Product.SPOT,
@@ -110,6 +109,7 @@ TIMEDELTA_MAP: dict[Interval, timedelta] = {
     Interval.WEEKLY: timedelta(days=7),
 }
 
+# Tick field map
 TICK_FIELD_BYBIT2VT: dict[str, str] = {
     "lastPrice": "last_price",
     "highPrice24h": "high_price",
@@ -216,8 +216,8 @@ class BybitGateway(BaseGateway):
     def close(self) -> None:
         """Close server connections"""
         self.rest_api.stop()
-        # self.private_ws_api.stop()
-        # self.public_ws_api.stop()
+        self.private_ws_api.stop()
+        self.public_ws_api.stop()
 
 
 class BybitRestApi(RestClient):
@@ -437,7 +437,7 @@ class BybitRestApi(RestClient):
         return order.vt_orderid
 
     def cancel_order(self, req: CancelRequest) -> None:
-        """委托撤单"""
+        """Cancel existing order"""
         # Create cancel parameters
         data: dict = {
             "category": symbol_category_map.get(req.symbol, ""),
@@ -544,12 +544,12 @@ class BybitRestApi(RestClient):
         return history
 
     def on_failed(self, status_code: int, request: Request) -> None:
-        """处理请求失败回报"""
+        """General failed callback"""
         data: dict = request.response.json()
         error_msg: str = data["ret_msg"]
         error_code: int = data["ret_code"]
 
-        msg = f"请求失败，状态码：{request.status}，错误代码：{error_code}, 信息：{error_msg}"
+        msg = f"Request failed, status code：{request.status}, error code: {error_code}, message: {error_msg}"
         self.gateway.write_log(msg)
 
     def on_error(
@@ -559,13 +559,11 @@ class BybitRestApi(RestClient):
         tb,
         request: Request
     ) -> None:
-        """触发异常回报"""
-        msg = f"触发异常，状态码：{exception_type}，信息：{exception_value}"
+        """General error callback"""
+        msg = f"Exception raised, type: {exception_type}, value: {exception_value}"
         self.gateway.write_log(msg)
 
-        sys.stderr.write(
-            self.exception_detail(exception_type, exception_value, tb, request)
-        )
+        sys.stderr.write(self.exception_detail(exception_type, exception_value, tb, request))
 
     def on_query_time(self, packet: dict, request: Request) -> None:
         """Callback of server time query"""
@@ -624,9 +622,6 @@ class BybitRestApi(RestClient):
             self.gateway.on_contract(contract)
 
         self.gateway.write_log(f"Available {category} contracts data is received")
-        # self.query_position()
-        # self.query_account()
-        # self.query_order()
 
     def on_query_order(self, data: dict, request: Request):
         """Callback of open orders query"""
@@ -728,7 +723,7 @@ class BybitRestApi(RestClient):
         self.on_error(exception_type, exception_value, tb, request)
 
     def on_send_order(self, data: dict, request: Request) -> None:
-        """Successful callback of send_order"""
+        """Successful callback of send order"""
         if data["retCode"]:
             msg = f"Send order failed, code: {data['retCode']}, message: {data['retMsg']}"
             self.gateway.write_log(msg)
@@ -738,7 +733,7 @@ class BybitRestApi(RestClient):
             self.gateway.on_order(order)
 
     def on_cancel_order(self, data: dict, request: Request) -> None:
-        """委托撤单回报"""
+        """Successful callback of cancel order"""
         if data["retCode"]:
             msg = f"Cancel order failed, code: {data['retCode']}, message: {data['retMsg']}"
             self.gateway.write_log(msg)
@@ -759,13 +754,9 @@ class BybitPublicWebsocketApi:
         self.gateway_name: str = gateway.gateway_name
 
         self.clients: dict[str, WebsocketClient] = {}
-
         self.callbacks: dict[str, Callable] = {}
         self.ticks: dict[str, TickData] = {}
         self.subscribed: dict[str, SubscribeRequest] = {}
-
-        self.symbol_bids: dict[str, dict] = {}
-        self.symbol_asks: dict[str, dict] = {}
 
     def connect(
         self,
@@ -833,7 +824,7 @@ class BybitPublicWebsocketApi:
         return client
 
     def subscribe(self, req: SubscribeRequest) -> None:
-        """订阅行情"""
+        """Subscribe market data"""
         # Check if already subscribed
         if req.symbol in self.subscribed:
             return
