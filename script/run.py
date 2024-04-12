@@ -6,7 +6,7 @@ from vnpy_bybit import BybitGateway
 
 
 def main():
-    """主入口函数"""
+    """Main function"""
     qapp = create_qapp()
 
     event_engine = EventEngine()

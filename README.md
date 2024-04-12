@@ -1,41 +1,56 @@
-# vn.py框架的BYBIT交易接口
+# Bybit trading gateway for VeighNa Evo
 
 <p align="center">
   <img src ="https://vnpy.oss-cn-shanghai.aliyuncs.com/vnpy-logo.png"/>
 </p>
 
 <p align="center">
-    <img src ="https://img.shields.io/badge/version-2021.10.25-blueviolet.svg"/>
+    <img src ="https://img.shields.io/badge/version-2024.4.12-blueviolet.svg"/>
     <img src ="https://img.shields.io/badge/platform-windows|linux|macos-yellow.svg"/>
-    <img src ="https://img.shields.io/badge/python-3.7-blue.svg" />
+    <img src ="https://img.shields.io/badge/python-3.10|3.11|3.12-blue.svg" />
     <img src ="https://img.shields.io/github/license/vnpy/vnpy.svg?color=orange"/>
 </p>
 
-关于使用VeighNa框架进行Crypto交易的话题，新开了一个[Github Discussions论坛](https://github.com/vn-crypto/vnpy_crypto/discussions)，欢迎通过这里来进行讨论交流。
+## Introduction
 
+This gateway is developed based on Bybit's V5 REST and Websocket API, and supports spot, linear contract, inverse contract and option trading.
 
-## 说明
+**For derivatives contract trading, please notice:**
 
-基于BYBIT交易所的接口开发，支持永续合约交易。
+1. Only supports unified trading account.
+2. Only supports cross margin and portfolio margin.
+3. Only supports one-way position mode.
 
-## 安装
+## Install
 
-下载解压后在cmd中运行
+Users can easily install ``vnpy_bybit`` by pip according to the following command.
 
 ```
+pip install vnpy_bybit
+```
+
+Also, users can install ``vnpy_bybit`` using the source code. Clone the repository and install as follows:
+
+```
+git clone https://github.com/veighna-global/vnpy_bybit.git && cd vnpy_bybit
+
 python setup.py install
 ```
 
-## 使用
+## A Simple Example
 
-以脚本方式启动（script/run.py）：
+Save this as run.py.
 
 ```
-from vnpy.event import EventEngine
-from vnpy.trader.engine import MainEngine
-from vnpy.trader.ui import MainWindow, create_qapp
+from vnpy_evo.event import EventEngine
+from vnpy_evo.trader.engine import MainEngine
+from vnpy_evo.trader.ui import MainWindow, create_qapp
 
-from vnpy_Bybit import BybitGateway
+from vnpy_bybit import (
+    BinanceSpotGateway,
+    BinanceLinearGateway,
+    BinanceInverseGateway
+)
 
 
 def main():
@@ -44,8 +59,10 @@ def main():
 
     event_engine = EventEngine()
     main_engine = MainEngine(event_engine)
-    main_engine.add_gateway(BybitGateway)
-    
+    main_engine.add_gateway(BinanceSpotGateway)
+    main_engine.add_gateway(BinanceLinearGateway)
+    main_engine.add_gateway(BinanceInverseGateway)
+
     main_window = MainWindow(main_engine, event_engine)
     main_window.showMaximized()
 

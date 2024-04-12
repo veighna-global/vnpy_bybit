@@ -1,6 +1,6 @@
 # The MIT License (MIT)
 #
-# Copyright (c) 2015-present, vn-crypto
+# Copyright (c) 2023-present, VeighNa Global
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -20,11 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import importlib_metadata
-
 from .bybit_gateway import BybitGateway
 
-try:
-    __version__ = importlib_metadata.version("vnpy_bybit")
-except importlib_metadata.PackageNotFoundError:
-    __version__ = "dev"
+
+__version__ = "2024.4.12"
