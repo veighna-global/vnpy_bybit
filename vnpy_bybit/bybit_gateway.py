@@ -7,6 +7,7 @@ from copy import copy
 from datetime import datetime, timedelta
 from typing import Callable
 from zoneinfo import ZoneInfo
+from functools import partial
 
 from vnpy_evo.event import EventEngine
 from vnpy_evo.trader.constant import (
@@ -40,7 +41,7 @@ from vnpy_websocket import WebsocketClient
 # Timezone
 BYBIT_TZ: ZoneInfo = ZoneInfo("Asia/Shanghai")
 
-# Mainnet server hosts
+# Real server hosts
 REAL_REST_HOST: str = "https://api.bybit.com"
 REAL_PRIVATE_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/private"
 REAL_SPOT_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/spot"
@@ -48,7 +49,7 @@ REAL_LINEAR_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/linear"
 REAL_INVERSE_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/inverse"
 REAL_OPTION_WEBSOCKET_HOST: str = "wss://stream.bybit.com/v5/public/option"
 
-# Testnet server hosts
+# Demo server hosts
 DEMO_REST_HOST: str = "https://api-demo.bybit.com"
 DEMO_PRIVATE_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/private"
 DEMO_SPOT_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/public/spot"
@@ -107,6 +108,15 @@ TIMEDELTA_MAP: dict[Interval, timedelta] = {
     Interval.HOUR: timedelta(hours=1),
     Interval.DAILY: timedelta(days=1),
     Interval.WEEKLY: timedelta(days=7),
+}
+
+TICK_FIELD_BYBIT2VT: dict[str, str] = {
+    "lastPrice": "last_price",
+    "highPrice24h": "high_price",
+    "lowPrice24h": "low_price",
+    "volume24h": "volume",
+    "turnover24h": "turnover",
+    "openInterest": "open_interest",
 }
 
 
@@ -173,11 +183,11 @@ class BybitGateway(BaseGateway):
             proxy_host,
             proxy_port
         )
-        # self.public_ws_api.connect(
-        #     server,
-        #     proxy_host,
-        #     proxy_port
-        # )
+        self.public_ws_api.connect(
+            server,
+            proxy_host,
+            proxy_port
+        )
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """Subscribe market data"""
@@ -729,15 +739,21 @@ class BybitRestApi(RestClient):
             self.gateway.write_log(msg)
 
 
-class BybitPublicWebsocketApi(WebsocketClient):
-    """正向合约的行情Websocket接口"""
+class BybitPublicWebsocketApi:
+    """The public websocket API of BybitGateway"""
 
     def __init__(self, gateway: BybitGateway) -> None:
-        """构造函数"""
+        """
+        The init method of the api.
+
+        gateway: the parent gateway object for pushing callback data.
+        """
         super().__init__()
 
         self.gateway: BybitGateway = gateway
         self.gateway_name: str = gateway.gateway_name
+
+        self.clients: dict[str, WebsocketClient] = {}
 
         self.callbacks: dict[str, Callable] = {}
         self.ticks: dict[str, TickData] = {}
@@ -752,43 +768,73 @@ class BybitPublicWebsocketApi(WebsocketClient):
         proxy_host: str,
         proxy_port: int
     ) -> None:
-        """连接Websocket公共频道"""
+        """Start server connection"""
+        self.server = server
         self.proxy_host = proxy_host
         self.proxy_port = proxy_port
-        self.server = server
 
+    def stop(self) -> None:
+        """Close server connection"""
+        for client in self.clients.values():
+            client.stop()
+
+    def get_client(self, category: str) -> WebsocketClient:
+        """Get the websocket client of specific category"""
+        client: WebsocketClient = self.clients.get(category, None)
+        if client:
+            return client
+
+        # Create client object
+        client = WebsocketClient()
+        self.clients[category] = client
+
+        client.is_connected = False
+
+        client.on_connected = partial(self.on_connected, category=category)
+        client.on_disconnected = partial(self.on_disconnected, category=category)
+        client.on_packet = partial(self.on_packet, category=category)
+        client.on_error = partial(self.on_error, category=category)
+
+        # Get host
         if self.server == "REAL":
-            url = PUBLIC_WEBSOCKET_HOST
+            category_host_map: dict = {
+                "spot": REAL_SPOT_WEBSOCKET_HOST,
+                "linear": REAL_LINEAR_WEBSOCKET_HOST,
+                "inverse": REAL_INVERSE_WEBSOCKET_HOST,
+                "option": REAL_OPTION_WEBSOCKET_HOST,
+            }
         else:
-            url = DEMO_PUBLIC_WEBSOCKET_HOST
+            category_host_map: dict = {
+                "spot": DEMO_SPOT_WEBSOCKET_HOST,
+                "linear": DEMO_LINEAR_WEBSOCKET_HOST,
+                "inverse": DEMO_INVERSE_WEBSOCKET_HOST,
+                "option": DEMO_OPTION_WEBSOCKET_HOST,
+            }
 
-        self.init(url, self.proxy_host, self.proxy_port)
-        self.start()
+        category_host_map: dict = {
+            "spot": REAL_SPOT_WEBSOCKET_HOST,
+            "linear": REAL_LINEAR_WEBSOCKET_HOST,
+            "inverse": REAL_INVERSE_WEBSOCKET_HOST,
+            "option": REAL_OPTION_WEBSOCKET_HOST,
+        }
 
-    def on_connected(self) -> None:
-        """连接成功回报"""
-        self.gateway.write_log("行情Websocket API连接成功")
+        host: str = category_host_map[category]
 
-        if self.subscribed:
-            for req in self.subscribed.values():
-                # 重新订阅请求
-                self.subscribe_topic(f"instrument_info.100ms.{req.symbol}", self.on_tick)
-                self.subscribe_topic(f"orderBookL2_25.{req.symbol}", self.on_depth)
+        # Start conection
+        client.init(host, self.proxy_host, self.proxy_port)
+        client.start()
 
-    def on_disconnected(self) -> None:
-        """连接断开回报"""
-        self.gateway.write_log("行情Websocket API连接断开")
+        # Return object
+        return client
 
     def subscribe(self, req: SubscribeRequest) -> None:
         """订阅行情"""
-
+        # Check if already subscribed
         if req.symbol in self.subscribed:
             return
-
-        # 缓存订阅记录
         self.subscribed[req.symbol] = req
 
-        # 创建TICK对象
+        # Create tick object
         tick: TickData = TickData(
             symbol=req.symbol,
             exchange=req.exchange,
@@ -798,143 +844,130 @@ class BybitPublicWebsocketApi(WebsocketClient):
         )
         self.ticks[req.symbol] = tick
 
-        # 发送订阅请求
-        self.subscribe_topic(f"instrument_info.100ms.{req.symbol}", self.on_tick)
-        self.subscribe_topic(f"orderBookL2_25.{req.symbol}", self.on_depth)
+        # Get websocket client
+        category: str = symbol_category_map.get(req.symbol, "")
+        if not category:
+            return
+        client: WebsocketClient = self.get_client(category)
+
+        # Send subscribe request
+        if client.is_connected:
+            if category == "option":
+                depth: int = 100
+            else:
+                depth: int = 200
+
+            self.subscribe_topic(client, f"tickers.{req.symbol}", self.on_ticker)
+            self.subscribe_topic(client, f"orderbook.{depth}.{req.symbol}", self.on_depth)
 
     def subscribe_topic(
         self,
+        client: WebsocketClient,
         topic: str,
         callback: Callable[[str, dict], object]
     ) -> None:
-        """订阅公共频道推送"""
+        """Subscribe topic of public stream"""
         self.callbacks[topic] = callback
 
         req: dict = {
             "op": "subscribe",
             "args": [topic],
         }
-        self.send_packet(req)
+        client.send_packet(req)
 
-    def on_packet(self, packet: dict) -> None:
-        """推送数据回报"""
-        if "topic" not in packet:
-            op: str = packet["request"]["op"]
-            if op == "auth":
-                self.on_login(packet)
-        else:
-            channel: str = packet["topic"]
-            callback: callable = self.callbacks[channel]
-            callback(packet)
+    def on_connected(self, category: str) -> None:
+        """Callback when server is connected"""
+        client: WebsocketClient = self.clients[category]
+        client.is_connected = True
+
+        self.gateway.write_log(f"Public websocket stream of {category} is connected")
+
+        # Send subscribe request
+        for req in self.subscribed.values():
+            if symbol_category_map.get(req.symbol, "") != category:
+                continue
+
+            if category == "option":
+                depth: int = 25
+            else:
+                depth: int = 50
+
+            self.subscribe_topic(client, f"tickers.{req.symbol}", self.on_ticker)
+            self.subscribe_topic(client, f"orderbook.{depth}.{req.symbol}", self.on_depth)
+
+    def on_disconnected(self, category: str) -> None:
+        """Callback when server is disconnected"""
+        client: WebsocketClient = self.get_client(category)
+        client.is_connected = False
+
+        self.gateway.write_log(f"Public websocket stream of {category} is disconnected")
+
+    def on_packet(self, packet: dict, category: str) -> None:
+        """Callback of data update"""
+        topic: str = packet.get("topic", "")
+        if not topic:
+            return
+
+        callback: callable = self.callbacks[topic]
+        callback(packet)
 
     def on_error(
         self,
         exception_type: type,
         exception_value: Exception,
-        tb
+        tb,
+        category: str
     ) -> None:
-        """触发异常回报"""
-        msg = f"触发异常，状态码：{exception_type}，信息：{exception_value}"
+        """General error callback"""
+        client: WebsocketClient = self.clients[category]
+        detail: str = client.exception_detail(exception_type, exception_value, tb)
+
+        msg: str = f"Exception catched by public websocket API: {detail}"
         self.gateway.write_log(msg)
 
-        sys.stderr.write(self.exception_detail(exception_type, exception_value, tb))
+        print(detail)
 
-    def on_tick(self, packet: dict) -> None:
-        """行情推送回报"""
+    def on_ticker(self, packet: dict) -> None:
+        """Callback of ticker update"""
         topic: str = packet["topic"]
-        type_: str = packet["type"]
         data: dict = packet["data"]
 
-        symbol: str = topic.replace("instrument_info.100ms.", "")
+        symbol: str = topic.replace("tickers.", "")
         tick: TickData = self.ticks[symbol]
 
-        if type_ == "snapshot":
-            if not data["last_price"]:           # 过滤最新价为0的数据
-                return
+        tick.datetime = generate_datetime(packet["ts"])
 
-            tick.last_price = float(data["last_price"])
+        data_fields: set[str] = set(data.keys())
+        tick_fields: set[str] = set(TICK_FIELD_BYBIT2VT.keys())
+        update_fields: set[str] = data_fields.intersection(tick_fields)
 
-            tick.volume = int(data["volume_24h_e8"]) / 100000000
-
-            tick.datetime = generate_datetime(data["updated_at"])
-
-        else:
-            update: dict = data["update"][0]
-
-            if "last_price" not in update:      # 过滤最新价为0的数据
-                return
-
-            tick.last_price = float(update["last_price"])
-
-            if update["volume_24h_e8"]:
-
-                tick.volume = int(update["volume_24h_e8"]) / 100000000
-
-            tick.datetime = generate_datetime(update["updated_at"])
+        for field in update_fields:
+            value: float = float(data[field])
+            name: str = TICK_FIELD_BYBIT2VT[field]
+            setattr(tick, name, value)
 
         self.gateway.on_tick(copy(tick))
 
     def on_depth(self, packet: dict) -> None:
-        """盘口推送回报"""
-        topic: str = packet["topic"]
-        type_: str = packet["type"]
+        """Callback of depth update"""
         data: dict = packet["data"]
-        if not data:
-            return
-
-        symbol: str = topic.replace("orderBookL2_25.", "")
+        symbol: str = data["s"]
         tick: TickData = self.ticks[symbol]
-        bids: dict = self.symbol_bids.setdefault(symbol, {})
-        asks: dict = self.symbol_asks.setdefault(symbol, {})
 
-        if type_ == "snapshot":
+        tick.datetime = generate_datetime(packet["ts"])
 
-            buf: list = data["order_book"]
+        bid_data: list = data["b"]
+        for i in range(min(5, len(bid_data))):
+            bp, bv = bid_data[i]
+            setattr(tick, f"bid_price_{i+1}", float(bp))
+            setattr(tick, f"bid_volume_{i+1}", float(bv))
 
-            for d in buf:
-                price: float = float(d["price"])
+        ask_data: list = data["a"]
+        for i in range(min(5, len(ask_data))):
+            ap, av = ask_data[i]
+            setattr(tick, f"ask_price_{i+1}", float(ap))
+            setattr(tick, f"ask_volume_{i+1}", float(av))
 
-                if d["side"] == "Buy":
-                    bids[price] = d
-                else:
-                    asks[price] = d
-        else:
-            for d in data["delete"]:
-                price: float = float(d["price"])
-
-                if d["side"] == "Buy":
-                    bids.pop(price)
-                else:
-                    asks.pop(price)
-
-            for d in (data["update"] + data["insert"]):
-
-                price: float = float(d["price"])
-                if d["side"] == "Buy":
-                    bids[price] = d
-                else:
-                    asks[price] = d
-
-        bid_keys: list = list(bids.keys())
-        bid_keys.sort(reverse=True)
-
-        ask_keys: list = list(asks.keys())
-        ask_keys.sort()
-
-        for i in range(5):
-            n = i + 1
-
-            bid_price = bid_keys[i]
-            bid_data = bids[bid_price]
-            ask_price = ask_keys[i]
-            ask_data = asks[ask_price]
-
-            setattr(tick, f"bid_price_{n}", bid_price)
-            setattr(tick, f"bid_volume_{n}", bid_data["size"])
-            setattr(tick, f"ask_price_{n}", ask_price)
-            setattr(tick, f"ask_volume_{n}", ask_data["size"])
-
-        tick.datetime = generate_datetime_2(int(packet["timestamp_e6"]) / 1000000)
         self.gateway.on_tick(copy(tick))
 
 
