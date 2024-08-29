@@ -34,8 +34,8 @@ from vnpy_evo.trader.object import (
     TickData,
     TradeData
 )
-from vnpy_rest import Request, RestClient
-from vnpy_websocket import WebsocketClient
+from vnpy_evo.rest import Request, RestClient
+from vnpy_evo.websocket import WebsocketClient
 
 
 # Timezone
@@ -907,21 +907,10 @@ class BybitPublicWebsocketApi:
         callback: callable = self.callbacks[topic]
         callback(packet)
 
-    def on_error(
-        self,
-        exception_type: type,
-        exception_value: Exception,
-        tb,
-        category: str
-    ) -> None:
+    def on_error(self, e: Exception) -> None:
         """General error callback"""
-        client: WebsocketClient = self.clients[category]
-        detail: str = client.exception_detail(exception_type, exception_value, tb)
-
-        msg: str = f"Exception catched by public websocket API: {detail}"
+        msg: str = f"Exception catched by public websocket API: {e}"
         self.gateway.write_log(msg)
-
-        print(detail)
 
     def on_ticker(self, packet: dict) -> None:
         """Callback of ticker update"""
@@ -1059,14 +1048,10 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             callback: callable = self.callbacks[channel]
             callback(packet)
 
-    def on_error(self, exception_type: type, exception_value: Exception, tb) -> None:
+    def on_error(self, e: Exception) -> None:
         """General error callback"""
-        detail: str = self.exception_detail(exception_type, exception_value, tb)
-
-        msg: str = f"Exception catched by private websocket API: {detail}"
+        msg: str = f"Exception catched by private websocket API: {e}"
         self.gateway.write_log(msg)
-
-        print(detail)
 
     def on_login(self, packet: dict):
         """Callback of user login"""
