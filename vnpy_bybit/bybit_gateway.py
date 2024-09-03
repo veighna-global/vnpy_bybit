@@ -668,10 +668,18 @@ class BybitRestApi(RestClient):
         result: dict = data["result"]
 
         for d in result["list"]:
+            balance: float = 0
+            if d["totalWalletBalance"]:
+                balance = float(d["totalWalletBalance"])
+
+            available: float = 0
+            if d["totalAvailableBalance"]:
+                available = float(d["totalAvailableBalance"])
+
             account: AccountData = AccountData(
                 accountid=d["accountType"],
-                balance=float(d["totalWalletBalance"]),
-                frozen=float(d["totalWalletBalance"]) - float(d["totalAvailableBalance"]),
+                balance=balance,
+                frozen=balance - available,
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_account(account)
