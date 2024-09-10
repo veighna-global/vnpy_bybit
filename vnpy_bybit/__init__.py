@@ -23,4 +23,4 @@
 from .bybit_gateway import BybitGateway
 
 
-__version__ = "2024.9.3"
+__version__ = "2024.9.10"
