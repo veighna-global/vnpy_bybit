@@ -532,10 +532,12 @@ class BybitRestApi(RestClient):
 
                 msg: str = f"Query kline history finished, {req.symbol} - {req.interval.value}, {begin_dt} - {end_dt}"
                 self.gateway.write_log(msg)
-                print(msg)
 
                 # Update start time
                 start_time: int = end
+
+                # Sleep 0.01s to avoid rate limit
+                time.sleep(0.01)
 
         index: list[datetime] = list(buf.keys())
         index.sort()
@@ -899,7 +901,7 @@ class BybitPublicWebsocketApi:
             self.subscribe_topic(client, f"tickers.{req.symbol}", self.on_ticker)
             self.subscribe_topic(client, f"orderbook.{depth}.{req.symbol}", self.on_depth)
 
-    def on_disconnected(self, category: str) -> None:
+    def on_disconnected(self, category: str, status_code: int, msg: str) -> None:
         """Callback when server is disconnected"""
         client: WebsocketClient = self.get_client(category)
         client.is_connected = False
@@ -1041,7 +1043,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         self.gateway.write_log("Private websocket stream is connected")
         self.login()
 
-    def on_disconnected(self) -> None:
+    def on_disconnected(self, status_code: int, msg: str) -> None:
         """Callback when server is disconnected"""
         self.gateway.write_log("Private websocket stream is disconnected")
 
