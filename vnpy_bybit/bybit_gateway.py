@@ -9,7 +9,8 @@ from typing import Callable
 from zoneinfo import ZoneInfo
 from functools import partial
 
-from vnpy_evo.event import EventEngine
+from vnpy_evo.event import EventEngine, Event
+from vnpy_evo.trader.event import EVENT_TIMER
 from vnpy_evo.trader.constant import (
     Direction,
     Exchange,
@@ -156,6 +157,8 @@ class BybitGateway(BaseGateway):
         self.private_ws_api: BybitPrivateWebsocketApi = BybitPrivateWebsocketApi(self)
         self.public_ws_api: BybitPublicWebsocketApi = BybitPublicWebsocketApi(self)
 
+        self.timer_count: int = 0
+
     def connect(self, setting: dict) -> None:
         """Start server connections"""
         key: str = setting["API Key"]
@@ -189,6 +192,8 @@ class BybitGateway(BaseGateway):
             proxy_port
         )
 
+        self.event_engine.register(EVENT_TIMER, self.process_timer_event)
+
     def subscribe(self, req: SubscribeRequest) -> None:
         """Subscribe market data"""
         self.public_ws_api.subscribe(req)
@@ -218,6 +223,16 @@ class BybitGateway(BaseGateway):
         self.rest_api.stop()
         self.private_ws_api.stop()
         self.public_ws_api.stop()
+
+    def process_timer_event(self, event: Event) -> None:
+        """Run time scheduled task"""
+        self.timer_count += 1
+        if self.timer_count < 20:
+            return
+        self.timer_count = 0
+
+        self.public_ws_api.send_heartbeat()
+        self.private_ws_api.send_heartbeat()
 
 
 class BybitRestApi(RestClient):
@@ -764,9 +779,13 @@ class BybitPublicWebsocketApi:
         self.gateway_name: str = gateway.gateway_name
 
         self.clients: dict[str, WebsocketClient] = {}
-        self.callbacks: dict[str, Callable] = {}
         self.ticks: dict[str, TickData] = {}
         self.subscribed: dict[str, SubscribeRequest] = {}
+
+        self.callbacks: dict[str, Callable] = {
+            "ping": self.on_heartbeat,
+            "pong": self.on_heartbeat
+        }
 
     def connect(
         self,
@@ -881,6 +900,13 @@ class BybitPublicWebsocketApi:
         }
         client.send_packet(req)
 
+    def send_heartbeat(self) -> None:
+        """Send heartbeat ping"""
+        for client in self.clients.values():
+            if client.is_connected:
+                req: dict = {"op": "ping"}
+                client.send_packet(req)
+
     def on_connected(self, category: str) -> None:
         """Callback when server is connected"""
         client: WebsocketClient = self.clients[category]
@@ -910,12 +936,16 @@ class BybitPublicWebsocketApi:
 
     def on_packet(self, packet: dict, category: str) -> None:
         """Callback of data update"""
-        topic: str = packet.get("topic", "")
-        if not topic:
+        if "topic" in packet:
+            channel: str = packet["topic"]
+        elif "op" in packet:
+            channel: str = packet["op"]
+        else:
             return
 
-        callback: callable = self.callbacks[topic]
-        callback(packet)
+        callback: callable = self.callbacks.get(channel, None)
+        if callback:
+            callback(packet)
 
     def on_error(self, e: Exception) -> None:
         """General error callback"""
@@ -965,6 +995,10 @@ class BybitPublicWebsocketApi:
 
         self.gateway.on_tick(copy(tick))
 
+    def on_heartbeat(self, packet: dict) -> None:
+        """Callback of heartbeat pong"""
+        pass
+
 
 class BybitPrivateWebsocketApi(WebsocketClient):
     """The private websocket API of BybitGateway"""
@@ -984,7 +1018,12 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         self.secret: str = ""
         self.server: str = ""
 
-        self.callbacks: dict[str, Callable] = {}
+        self.callbacks: dict[str, Callable] = {
+            "auth": self.on_login,
+            "pong": self.on_heartbeat
+        }
+
+        self.is_connected: bool = False
 
     def connect(
         self,
@@ -1038,24 +1077,34 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         }
         self.send_packet(req)
 
+    def send_heartbeat(self) -> None:
+        """Send heartbeat ping"""
+        if self.is_connected:
+            req: dict = {"op": "ping"}
+            self.send_packet(req)
+
     def on_connected(self) -> None:
         """Callback when server is connected"""
+        self.is_connected = True
         self.gateway.write_log("Private websocket stream is connected")
         self.login()
 
     def on_disconnected(self, status_code: int, msg: str) -> None:
         """Callback when server is disconnected"""
+        self.is_connected = False
         self.gateway.write_log("Private websocket stream is disconnected")
 
     def on_packet(self, packet: dict) -> None:
         """Callback of data update"""
-        if "topic" not in packet:
-            op: str = packet["op"]
-            if op == "auth":
-                self.on_login(packet)
-        else:
+        if "topic" in packet:
             channel: str = packet["topic"]
-            callback: callable = self.callbacks[channel]
+        elif "op" in packet:
+            channel: str = packet["op"]
+        else:
+            return
+
+        callback: callable = self.callbacks.get(channel, None)
+        if callback:
             callback(packet)
 
     def on_error(self, e: Exception) -> None:
@@ -1146,6 +1195,10 @@ class BybitPrivateWebsocketApi(WebsocketClient):
                 gateway_name=self.gateway_name
             )
             self.gateway.on_position(position)
+
+    def on_heartbeat(self, packet: dict) -> None:
+        """Callback of heartbeat pong"""
+        pass
 
 
 def generate_signature(secret: str, param_str: str) -> str:
