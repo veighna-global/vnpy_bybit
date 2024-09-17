@@ -540,13 +540,16 @@ class BybitRestApi(RestClient):
                 end: datetime = kline_data[0][0]
                 end_dt = generate_datetime(int(end))
 
-                # Break loop if all data received
-                if end_dt == last_end_dt:
-                    break
-                last_end_dt = end_dt
-
                 msg: str = f"Query kline history finished, {req.symbol} - {req.interval.value}, {begin_dt} - {end_dt}"
                 self.gateway.write_log(msg)
+
+                # Break loop if all data received
+                if (
+                    (req.end and end_dt >= req.end)
+                    or end_dt == last_end_dt
+                ):
+                    break
+                last_end_dt = end_dt
 
                 # Update start time
                 start_time: int = end
