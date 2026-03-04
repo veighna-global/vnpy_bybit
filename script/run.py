@@ -1,11 +1,11 @@
-from vnpy_evo.event import EventEngine
-from vnpy_evo.trader.engine import MainEngine
-from vnpy_evo.trader.ui import MainWindow, create_qapp
+from vnpy.event import EventEngine
+from vnpy.trader.engine import MainEngine
+from vnpy.trader.ui import MainWindow, create_qapp
 
 from vnpy_bybit import BybitGateway
 
 
-def main():
+def main() -> None:
     """Main function"""
     qapp = create_qapp()
 

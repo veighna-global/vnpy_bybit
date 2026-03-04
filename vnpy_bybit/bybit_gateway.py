@@ -60,6 +60,15 @@ DEMO_LINEAR_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/public/linear"
 DEMO_INVERSE_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/public/inverse"
 DEMO_OPTION_WEBSOCKET_HOST: str = "wss://stream-demo.bybit.com/v5/public/option"
 
+# Testnet server hosts
+TESTNET_REST_HOST: str = "https://api-testnet.bybit.com"
+TESTNET_PRIVATE_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/private"
+TESTNET_TRADE_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/trade"
+TESTNET_SPOT_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/spot"
+TESTNET_LINEAR_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/linear"
+TESTNET_INVERSE_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/inverse"
+TESTNET_OPTION_WEBSOCKET_HOST: str = "wss://stream-testnet.bybit.com/v5/public/option"
+
 # Product type map
 PRODUCT_BYBIT2VT: dict[str, Product] = {
     "spot": Product.SPOT,
@@ -135,12 +144,12 @@ class BybitGateway(BaseGateway):
     through Bybit V5 API.
     """
 
-    default_name: str = "GLOBAL"
+    default_name: str = "BYBIT"
 
     default_setting: dict = {
         "API Key": "",
         "Secret Key": "",
-        "Server": ["REAL", "DEMO"],
+        "Server": ["REAL", "DEMO", "TESTNET"],
         "Proxy Host": "",
         "Proxy Port": 0,
     }
@@ -209,8 +218,7 @@ class BybitGateway(BaseGateway):
             secret,
             server,
             proxy_host,
-            proxy_port,
-            self.rest_api.time_offset
+            proxy_port
         )
 
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
@@ -436,29 +444,6 @@ class BybitRestApi(RestClient):
         orderid: str = prefix + suffix
         return orderid
 
-    def check_error(self, name: str, data: dict) -> bool:
-        """
-        Check response error status.
-
-        This function checks if the API response contains an error code
-        and logs the error details.
-
-        Parameters:
-            name: Name of the operation being checked
-            data: Response data dictionary containing error information
-
-        Returns:
-            bool: True if an error was found, False otherwise
-        """
-        if data["ret_code"]:
-            error_code: int = data["ret_code"]
-            error_msg: str = data["ret_msg"]
-            msg: str = f"{name} failed, error code: {error_code}, message: {error_msg}"
-            self.gateway.write_log(msg)
-            return True
-
-        return False
-
     def connect(
         self,
         key: str,
@@ -487,6 +472,7 @@ class BybitRestApi(RestClient):
         server_hosts: dict[str, str] = {
             "REAL": REAL_REST_HOST,
             "DEMO": DEMO_REST_HOST,
+            "TESTNET": TESTNET_REST_HOST,
         }
 
         host: str = server_hosts[server]
@@ -567,15 +553,14 @@ class BybitRestApi(RestClient):
         This function sends requests to get wallet balance
         for both UNIFIED and CONTRACT account types.
         """
-        for account_type in ["UNIFIED", "CONTRACT"]:
-            params: dict = {"accountType": account_type}
+        params: dict = {"accountType": "UNIFIED"}
 
-            self.add_request(
-                "GET",
-                "/v5/account/wallet-balance",
-                self.on_query_account,
-                params=params
-            )
+        self.add_request(
+            "GET",
+            "/v5/account/wallet-balance",
+            self.on_query_account,
+            params=params
+        )
 
     def query_position(self) -> None:
         """
@@ -827,11 +812,20 @@ class BybitRestApi(RestClient):
             status_code: HTTP status code
             request: Original request object
         """
-        data: dict = request.response.json()
-        error_msg: str = data["ret_msg"]
-        error_code: int = data["ret_code"]
+        try:
+            data: dict = request.response.json()
+            error_code: int = data["retCode"]
+            error_msg: str = data["retMsg"]
+            msg: str = (
+                f"Request failed, status code: {status_code},"
+                f" error code: {error_code}, message: {error_msg}"
+            )
+        except Exception:
+            msg = (
+                f"Request failed, status code: {status_code},"
+                f" response: {request.response.text}"
+            )
 
-        msg: str = f"Request failed, status code: {status_code}, error code: {error_code}, message: {error_msg}"
         self.gateway.write_log(msg)
 
     def on_error(
@@ -904,8 +898,8 @@ class BybitRestApi(RestClient):
             name: str = d["symbol"]
             actual_product: Product = product
 
-            # If symbol contains digit, then it should be a futures contract
-            if product == Product.SWAP and not name.isalpha():
+            contract_type: str = d.get("contractType", "")
+            if contract_type in ("LinearFutures", "InverseFutures"):
                 actual_product = Product.FUTURES
 
             # Generate VeighNa symbol with product type suffix
@@ -950,6 +944,21 @@ class BybitRestApi(RestClient):
             self.gateway.on_contract(contract)
 
         self.gateway.write_log(f"Available {category} contracts data is received")
+
+        # Continue fetching next page if cursor exists
+        cursor: str = result.get("nextPageCursor", "")
+        if cursor:
+            params: dict = {
+                "category": category,
+                "limit": 1000,
+                "cursor": cursor
+            }
+            self.add_request(
+                "GET",
+                "/v5/market/instruments-info",
+                self.on_query_contract,
+                params=params
+            )
 
     def on_query_order(self, data: dict, request: Request) -> None:
         """
@@ -1005,7 +1014,7 @@ class BybitRestApi(RestClient):
         Callback of account balance query.
 
         This function processes the account balance response and creates
-        AccountData objects for each account type.
+        AccountData objects for each coin.
 
         Parameters:
             data: Response data from the server
@@ -1019,21 +1028,22 @@ class BybitRestApi(RestClient):
         result: dict = data["result"]
 
         for d in result["list"]:
-            balance: float = 0
-            if d["totalWalletBalance"]:
-                balance = float(d["totalWalletBalance"])
+            for coin_data in d["coin"]:
+                balance: float = 0
+                if coin_data["walletBalance"]:
+                    balance = float(coin_data["walletBalance"])
 
-            available: float = 0
-            if d["totalAvailableBalance"]:
-                available = float(d["totalAvailableBalance"])
+                available: float = 0
+                if coin_data["availableToWithdraw"]:
+                    available = float(coin_data["availableToWithdraw"])
 
-            account: AccountData = AccountData(
-                accountid=d["accountType"],
-                balance=balance,
-                frozen=balance - available,
-                gateway_name=self.gateway_name,
-            )
-            self.gateway.on_account(account)
+                account: AccountData = AccountData(
+                    accountid=coin_data["coin"],
+                    balance=balance,
+                    frozen=balance - available,
+                    gateway_name=self.gateway_name,
+                )
+                self.gateway.on_account(account)
 
     def on_query_position(self, data: dict, request: Request) -> None:
         """
@@ -1252,6 +1262,13 @@ class BybitPublicWebsocketApi:
                 "inverse": REAL_INVERSE_WEBSOCKET_HOST,
                 "option": REAL_OPTION_WEBSOCKET_HOST,
             }
+        elif self.server == "TESTNET":
+            category_host_map = {
+                "spot": TESTNET_SPOT_WEBSOCKET_HOST,
+                "linear": TESTNET_LINEAR_WEBSOCKET_HOST,
+                "inverse": TESTNET_INVERSE_WEBSOCKET_HOST,
+                "option": TESTNET_OPTION_WEBSOCKET_HOST,
+            }
         else:
             category_host_map = {
                 "spot": DEMO_SPOT_WEBSOCKET_HOST,
@@ -1429,7 +1446,8 @@ class BybitPublicWebsocketApi:
             e: Exception instance
             category: The product category of the source client
         """
-        msg: str = f"Exception catched by public websocket API: {e}"
+        detail: str = str(e).replace("{", "{{").replace("}", "}}")
+        msg: str = f"Exception catched by public websocket API: {detail}"
         self.gateway.write_log(msg)
 
     def on_ticker(self, packet: dict, category: str) -> None:
@@ -1569,6 +1587,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         server_hosts: dict[str, str] = {
             "REAL": REAL_PRIVATE_WEBSOCKET_HOST,
             "DEMO": DEMO_PRIVATE_WEBSOCKET_HOST,
+            "TESTNET": TESTNET_PRIVATE_WEBSOCKET_HOST,
         }
 
         url: str = server_hosts[self.server]
@@ -1679,7 +1698,8 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         Parameters:
             e: Exception instance
         """
-        msg: str = f"Exception catched by private websocket API: {e}"
+        detail: str = str(e).replace("{", "{{").replace("}", "}}")
+        msg: str = f"Exception catched by private websocket API: {detail}"
         self.gateway.write_log(msg)
 
     def on_login(self, packet: dict) -> None:
@@ -1702,26 +1722,36 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             self.subscribe_topic("position", self.on_position)
             self.subscribe_topic("wallet", self.on_account)
         else:
-            self.gateway.write_log(f"Private websocket stream login failed: {packet['ret_msg']}")
+            error_msg: str = packet.get("ret_msg", packet.get("retMsg", ""))
+            self.gateway.write_log(f"Private websocket stream login failed: {error_msg}")
 
     def on_account(self, packet: dict) -> None:
         """
         Callback of account balance update.
 
         This function processes account balance updates and creates
-        AccountData objects for each account type.
+        AccountData objects for each coin.
 
         Parameters:
             packet: Account update data from websocket
         """
         for d in packet["data"]:
-            account: AccountData = AccountData(
-                accountid=d["accountType"],
-                balance=float(d["totalWalletBalance"]),
-                frozen=(float(d["totalWalletBalance"]) - float(d["totalAvailableBalance"])),
-                gateway_name=self.gateway_name,
-            )
-            self.gateway.on_account(account)
+            for coin_data in d["coin"]:
+                balance: float = 0
+                if coin_data["walletBalance"]:
+                    balance = float(coin_data["walletBalance"])
+
+                available: float = 0
+                if coin_data["availableToWithdraw"]:
+                    available = float(coin_data["availableToWithdraw"])
+
+                account: AccountData = AccountData(
+                    accountid=coin_data["coin"],
+                    balance=balance,
+                    frozen=balance - available,
+                    gateway_name=self.gateway_name,
+                )
+                self.gateway.on_account(account)
 
     def on_trade(self, packet: dict) -> None:
         """
@@ -1849,7 +1879,6 @@ class BybitTradeWebsocketApi(WebsocketClient):
         self.server: str = ""
         self.proxy_host: str = ""
         self.proxy_port: int = 0
-        self.time_offset: int = 0
 
         self.callbacks: dict[str, Callable] = {
             "auth": self.on_login,
@@ -1866,8 +1895,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
         secret: str,
         server: str,
         proxy_host: str,
-        proxy_port: int,
-        time_offset: int = 0
+        proxy_port: int
     ) -> None:
         """
         Start server connection.
@@ -1881,19 +1909,18 @@ class BybitTradeWebsocketApi(WebsocketClient):
             server: Server type ("REAL" or "DEMO")
             proxy_host: Proxy server hostname or IP
             proxy_port: Proxy server port
-            time_offset: Time offset between local and server time in ms
         """
         self.key = key
         self.secret = secret
         self.proxy_host = proxy_host
         self.proxy_port = proxy_port
         self.server = server
-        self.time_offset = time_offset
 
         # Select websocket host based on server environment
         server_hosts: dict[str, str] = {
             "REAL": REAL_TRADE_WEBSOCKET_HOST,
             "DEMO": DEMO_TRADE_WEBSOCKET_HOST,
+            "TESTNET": TESTNET_TRADE_WEBSOCKET_HOST,
         }
 
         url: str = server_hosts[self.server]
@@ -1951,11 +1978,11 @@ class BybitTradeWebsocketApi(WebsocketClient):
             return order.vt_orderid
 
         # Prepare timestamp and receive window for signature
-        timestamp: int = int(time.time() * 1000) - self.time_offset
+        timestamp: int = int(time.time() * 1000) - self.gateway.rest_api.time_offset
         recv_window: int = 30_000
 
         # Generate unique request ID for tracking
-        reqid: str = f"order_{uuid.uuid4()}"
+        reqid: str = str(uuid.uuid4())
         self.reqid_orderid_map[reqid] = orderid
 
         # Create order parameters
@@ -1967,7 +1994,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
             "qty": str(req.volume),
             "price": str(req.price),
             "orderLinkId": orderid,
-            "timeInForce": "GoodTillCancel"
+            "timeInForce": "GTC"
         }
 
         # Set reduce-only flag for closing orders
@@ -1993,6 +2020,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
             "args": [args]
         }
         self.send_packet(req_data)
+        print(f"sending order: {req_data}")
 
         return order.vt_orderid
 
@@ -2014,10 +2042,10 @@ class BybitTradeWebsocketApi(WebsocketClient):
             return
 
         # Generate unique request ID for tracking
-        reqid: str = f"cancel_{uuid.uuid4()}"
+        reqid: str = str(uuid.uuid4())
 
         # Prepare timestamp and receive window for signature
-        timestamp: int = int(time.time() * 1000) - self.time_offset
+        timestamp: int = int(time.time() * 1000) - self.gateway.rest_api.time_offset
         recv_window: int = 30_000
 
         args: dict = {
@@ -2104,8 +2132,9 @@ class BybitTradeWebsocketApi(WebsocketClient):
             callback: Callable | None = self.callbacks.get(op, None)
             if callback:
                 callback(packet)
-        elif "reqId" in packet:
-            # Route to send_order or cancel_order callback based on reqId
+                return
+
+        if "reqId" in packet:
             reqid: str = packet["reqId"]
             if reqid in self.reqid_orderid_map:
                 self.on_send_order(packet)
@@ -2119,7 +2148,8 @@ class BybitTradeWebsocketApi(WebsocketClient):
         Parameters:
             e: Exception instance
         """
-        msg: str = f"Exception catched by trade websocket API: {e}"
+        detail: str = str(e).replace("{", "{{").replace("}", "}}")
+        msg: str = f"Exception catched by trade websocket API: {detail}"
         self.gateway.write_log(msg)
 
     def on_login(self, packet: dict) -> None:
@@ -2151,6 +2181,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
 
         if packet["retCode"] != 0:
             self.gateway.write_log(f"Send order failed: {packet['retMsg']}")
+            print(f"send order error: {packet}")
 
             order: OrderData = OrderData(
                 symbol="",
