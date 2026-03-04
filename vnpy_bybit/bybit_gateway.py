@@ -135,7 +135,7 @@ class BybitGateway(BaseGateway):
     through Bybit V5 API.
     """
 
-    default_name: str = "BYBIT"
+    default_name: str = "GLOBAL"
 
     default_setting: dict = {
         "API Key": "",
@@ -145,7 +145,7 @@ class BybitGateway(BaseGateway):
         "Proxy Port": 0,
     }
 
-    exchanges: list[Exchange] = [Exchange.BYBIT]
+    exchanges: list[Exchange] = [Exchange.GLOBAL]
 
     def __init__(self, event_engine: EventEngine, gateway_name: str) -> None:
         """
@@ -160,6 +160,9 @@ class BybitGateway(BaseGateway):
         self.private_ws_api: BybitPrivateWebsocketApi = BybitPrivateWebsocketApi(self)
         self.public_ws_api: BybitPublicWebsocketApi = BybitPublicWebsocketApi(self)
         self.trade_ws_api: BybitTradeWebsocketApi = BybitTradeWebsocketApi(self)
+
+        self.symbol_contract_map: dict[str, ContractData] = {}
+        self.name_contract_map: dict[str, ContractData] = {}
 
         self.timer_count: int = 0
 
@@ -285,6 +288,45 @@ class BybitGateway(BaseGateway):
             list[BarData]: List of historical kline data bars
         """
         return self.rest_api.query_history(req)
+
+    def on_contract(self, contract: ContractData) -> None:
+        """
+        Cache contract data and push a contract event.
+
+        Parameters:
+            contract: Contract data object
+        """
+        self.symbol_contract_map[contract.symbol] = contract
+
+        category: str = symbol_category_map.get(contract.symbol, "")
+        self.name_contract_map[f"{category}:{contract.name}"] = contract
+
+        super().on_contract(contract)
+
+    def get_contract_by_symbol(self, symbol: str) -> ContractData | None:
+        """
+        Get contract by VeighNa symbol.
+
+        Parameters:
+            symbol: The VeighNa symbol of the contract
+
+        Returns:
+            ContractData: Contract data object if found, None otherwise
+        """
+        return self.symbol_contract_map.get(symbol, None)
+
+    def get_contract_by_name(self, name: str, category: str) -> ContractData | None:
+        """
+        Get contract by exchange symbol name and category.
+
+        Parameters:
+            name: The exchange name of the contract
+            category: The product category (spot, linear, inverse, option)
+
+        Returns:
+            ContractData: Contract data object if found, None otherwise
+        """
+        return self.name_contract_map.get(f"{category}:{name}", None)
 
     def close(self) -> None:
         """
@@ -588,10 +630,18 @@ class BybitRestApi(RestClient):
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
         self.gateway.on_order(order)
 
+        # Look up contract for exchange name
+        contract: ContractData | None = self.gateway.get_contract_by_symbol(req.symbol)
+        if not contract:
+            self.gateway.write_log(f"Failed to send order, symbol not found: {req.symbol}")
+            order.status = Status.REJECTED
+            self.gateway.on_order(order)
+            return order.vt_orderid
+
         # Create order parameters
         data: dict = {
             "category": symbol_category_map.get(req.symbol, ""),
-            "symbol": req.symbol,
+            "symbol": contract.name,
             "orderType": ORDER_TYPE_VT2BYBIT[req.type],
             "side": DIRECTION_VT2BYBIT[req.direction],
             "qty": str(req.volume),
@@ -627,10 +677,16 @@ class BybitRestApi(RestClient):
         Parameters:
             req: Cancel request object containing order details
         """
+        # Look up contract for exchange name
+        contract: ContractData | None = self.gateway.get_contract_by_symbol(req.symbol)
+        if not contract:
+            self.gateway.write_log(f"Failed to cancel order, symbol not found: {req.symbol}")
+            return
+
         # Create cancel parameters
         data: dict = {
             "category": symbol_category_map.get(req.symbol, ""),
-            "symbol": req.symbol
+            "symbol": contract.name
         }
 
         # Determine the type of order ID to use for cancellation
@@ -664,6 +720,16 @@ class BybitRestApi(RestClient):
         Returns:
             list[BarData]: List of historical kline data bars
         """
+        # Look up contract for exchange name
+        contract: ContractData | None = self.gateway.get_contract_by_symbol(req.symbol)
+        if not contract:
+            self.gateway.write_log(f"Failed to query history, symbol not found: {req.symbol}")
+            return []
+
+        if not req.interval:
+            self.gateway.write_log(f"Failed to query history, interval not specified: {req.symbol}")
+            return []
+
         count: int = 1000
         start_time: int = int(req.start.timestamp()) * 1000
         category: str = symbol_category_map.get(req.symbol, "")
@@ -675,7 +741,7 @@ class BybitRestApi(RestClient):
             # Create query params
             params: dict = {
                 "category": category,
-                "symbol": req.symbol,
+                "symbol": contract.name,
                 "interval": INTERVAL_VT2BYBIT[req.interval],
                 "start": start_time,
                 "limit": count
@@ -835,11 +901,29 @@ class BybitRestApi(RestClient):
         product: Product = PRODUCT_BYBIT2VT[category]
 
         for d in result["list"]:
+            name: str = d["symbol"]
+            actual_product: Product = product
+
+            # If symbol contains digit, then it should be a futures contract
+            if product == Product.SWAP and not name.isalpha():
+                actual_product = Product.FUTURES
+
+            # Generate VeighNa symbol with product type suffix
+            match actual_product:
+                case Product.SPOT:
+                    symbol: str = name + "_SPOT_BYBIT"
+                case Product.SWAP:
+                    symbol = name + "_SWAP_BYBIT"
+                case Product.FUTURES:
+                    symbol = name + "_FUTURES_BYBIT"
+                case Product.OPTION:
+                    symbol = name + "_OPTION_BYBIT"
+
             contract: ContractData = ContractData(
-                symbol=d["symbol"],
-                exchange=Exchange.BYBIT,
-                name=d["symbol"],
-                product=product,
+                symbol=symbol,
+                exchange=Exchange.GLOBAL,
+                name=name,
+                product=actual_product,
                 size=1,
                 pricetick=float(d["priceFilter"]["tickSize"]),
                 min_volume=float(d["lotSizeFilter"]["minOrderQty"]),
@@ -848,19 +932,15 @@ class BybitRestApi(RestClient):
                 gateway_name=self.gateway_name
             )
 
-            # If symbol contains digit, then it should be a futures contract
-            if product == Product.SWAP and not contract.symbol.isalpha():
-                contract.product = Product.FUTURES
-
             # Add extra option contract fields
-            if product == Product.OPTION:
-                buf: list = contract.symbol.split("-")
+            if actual_product == Product.OPTION:
+                buf: list = name.split("-")
 
                 contract.option_strike = int(buf[2])
                 contract.option_underlying = "-".join(buf[:2])
                 contract.option_type = OPTION_TYPE_BYBIT2VT[d["optionsType"]]
-                contract.option_listed = generate_datetime(float(d["launchTime"]))
-                contract.option_expiry = generate_datetime(float(d["deliveryTime"]))
+                contract.option_listed = generate_datetime(int(d["launchTime"]))
+                contract.option_expiry = generate_datetime(int(d["deliveryTime"]))
                 contract.option_portfolio = buf[0]
                 contract.option_index = str(contract.option_strike)
 
@@ -891,9 +971,13 @@ class BybitRestApi(RestClient):
         category: str = result["category"]
 
         for d in result["list"]:
+            contract: ContractData | None = self.gateway.get_contract_by_name(d["symbol"], category)
+            if not contract:
+                continue
+
             order: OrderData = OrderData(
-                symbol=d["symbol"],
-                exchange=Exchange.BYBIT,
+                symbol=contract.symbol,
+                exchange=Exchange.GLOBAL,
                 orderid=d["orderLinkId"],
                 type=ORDER_TYPE_BYBIT2VT[d["orderType"]],
                 direction=DIRECTION_BYBIT2VT[d["side"]],
@@ -968,8 +1052,13 @@ class BybitRestApi(RestClient):
             return
 
         result: dict = data["result"]
+        category: str = result["category"]
 
         for d in result["list"]:
+            contract: ContractData | None = self.gateway.get_contract_by_name(d["symbol"], category)
+            if not contract:
+                continue
+
             # Determine position volume and direction from side field
             volume: float = 0
             if d["side"] == "Buy":
@@ -978,8 +1067,8 @@ class BybitRestApi(RestClient):
                 volume = -float(d["size"])
 
             position: PositionData = PositionData(
-                symbol=d["symbol"],
-                exchange=Exchange.BYBIT,
+                symbol=contract.symbol,
+                exchange=Exchange.GLOBAL,
                 direction=Direction.NET,
                 volume=volume,
                 price=float(d["avgPrice"]),
@@ -1195,20 +1284,27 @@ class BybitPublicWebsocketApi:
             return
         self.subscribed[req.symbol] = req
 
-        # Create tick object
-        tick: TickData = TickData(
-            symbol=req.symbol,
-            exchange=req.exchange,
-            datetime=datetime.now(),
-            name=req.symbol,
-            gateway_name=self.gateway_name
-        )
-        self.ticks[req.symbol] = tick
+        # Look up contract for exchange name
+        contract: ContractData | None = self.gateway.get_contract_by_symbol(req.symbol)
+        if not contract:
+            return
 
         # Get websocket client for the symbol's category
         category: str = symbol_category_map.get(req.symbol, "")
         if not category:
             return
+
+        # Create tick object keyed by category:exchange_name
+        tick: TickData = TickData(
+            symbol=req.symbol,
+            exchange=req.exchange,
+            datetime=datetime.now(),
+            name=contract.name,
+            gateway_name=self.gateway_name
+        )
+        tick_key: str = f"{category}:{contract.name}"
+        self.ticks[tick_key] = tick
+
         client: WebsocketClient = self.get_client(category)
 
         # Send subscribe request if connected
@@ -1219,14 +1315,14 @@ class BybitPublicWebsocketApi:
             else:
                 depth = 200
 
-            self.subscribe_topic(client, f"tickers.{req.symbol}", self.on_ticker)
-            self.subscribe_topic(client, f"orderbook.{depth}.{req.symbol}", self.on_depth)
+            self.subscribe_topic(client, f"tickers.{contract.name}", self.on_ticker)
+            self.subscribe_topic(client, f"orderbook.{depth}.{contract.name}", self.on_depth)
 
     def subscribe_topic(
         self,
         client: WebsocketClient,
         topic: str,
-        callback: Callable[[str, dict], object]
+        callback: Callable[[dict, str], object]
     ) -> None:
         """
         Subscribe to a topic of the public stream.
@@ -1276,14 +1372,18 @@ class BybitPublicWebsocketApi:
             if symbol_category_map.get(req.symbol, "") != category:
                 continue
 
+            contract: ContractData | None = self.gateway.get_contract_by_symbol(req.symbol)
+            if not contract:
+                continue
+
             # Option orderbook supports max 100 levels, others support 200
             if category == "option":
                 depth: int = 100
             else:
                 depth = 200
 
-            self.subscribe_topic(client, f"tickers.{req.symbol}", self.on_ticker)
-            self.subscribe_topic(client, f"orderbook.{depth}.{req.symbol}", self.on_depth)
+            self.subscribe_topic(client, f"tickers.{contract.name}", self.on_ticker)
+            self.subscribe_topic(client, f"orderbook.{depth}.{contract.name}", self.on_depth)
 
     def on_disconnected(self, category: str, status_code: int, msg: str) -> None:
         """
@@ -1312,14 +1412,14 @@ class BybitPublicWebsocketApi:
         """
         if "topic" in packet:
             channel: str = packet["topic"]
+            callback: Callable | None = self.callbacks.get(channel, None)
+            if callback:
+                callback(packet, category)
         elif "op" in packet:
             channel = packet["op"]
-        else:
-            return
-
-        callback: Callable | None = self.callbacks.get(channel, None)
-        if callback:
-            callback(packet)
+            callback = self.callbacks.get(channel, None)
+            if callback:
+                callback(packet)
 
     def on_error(self, e: Exception, category: str = "") -> None:
         """
@@ -1332,7 +1432,7 @@ class BybitPublicWebsocketApi:
         msg: str = f"Exception catched by public websocket API: {e}"
         self.gateway.write_log(msg)
 
-    def on_ticker(self, packet: dict) -> None:
+    def on_ticker(self, packet: dict, category: str) -> None:
         """
         Callback of ticker update.
 
@@ -1342,13 +1442,17 @@ class BybitPublicWebsocketApi:
 
         Parameters:
             packet: Ticker data from websocket
+            category: The product category of the source client
         """
         topic: str = packet["topic"]
         data: dict = packet["data"]
 
-        # Extract symbol from topic string (format: "tickers.SYMBOL")
-        symbol: str = topic.replace("tickers.", "")
-        tick: TickData = self.ticks[symbol]
+        # Extract exchange name from topic string (format: "tickers.NAME")
+        exchange_name: str = topic.replace("tickers.", "")
+        tick_key: str = f"{category}:{exchange_name}"
+        tick: TickData | None = self.ticks.get(tick_key)
+        if not tick:
+            return
 
         tick.datetime = generate_datetime(packet["ts"])
 
@@ -1359,12 +1463,12 @@ class BybitPublicWebsocketApi:
 
         for field in update_fields:
             value: float = float(data[field])
-            name: str = TICK_FIELD_BYBIT2VT[field]
-            setattr(tick, name, value)
+            field_name: str = TICK_FIELD_BYBIT2VT[field]
+            setattr(tick, field_name, value)
 
         self.gateway.on_tick(copy(tick))
 
-    def on_depth(self, packet: dict) -> None:
+    def on_depth(self, packet: dict, category: str) -> None:
         """
         Callback of depth update.
 
@@ -1374,10 +1478,14 @@ class BybitPublicWebsocketApi:
 
         Parameters:
             packet: Depth data from websocket
+            category: The product category of the source client
         """
         data: dict = packet["data"]
-        symbol: str = data["s"]
-        tick: TickData = self.ticks[symbol]
+        exchange_name: str = data["s"]
+        tick_key: str = f"{category}:{exchange_name}"
+        tick: TickData | None = self.ticks.get(tick_key)
+        if not tick:
+            return
 
         tick.datetime = generate_datetime(packet["ts"])
 
@@ -1492,7 +1600,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
     def subscribe_topic(
         self,
         topic: str,
-        callback: Callable[[str, dict], object]
+        callback: Callable[[dict], object]
     ) -> None:
         """
         Subscribe to a websocket stream topic.
@@ -1548,7 +1656,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         Callback of data update.
 
         This function dispatches incoming websocket messages to the
-        appropriate callback handler based on the topic or op field.
+        appropriate callback handler based on the topic or op field.c
 
         Parameters:
             packet: Data packet from websocket
@@ -1626,9 +1734,14 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             packet: Trade update data from websocket
         """
         for d in packet["data"]:
+            category: str = d.get("category", "")
+            contract: ContractData | None = self.gateway.get_contract_by_name(d["symbol"], category)
+            if not contract:
+                continue
+
             trade: TradeData = TradeData(
-                symbol=d["symbol"],
-                exchange=Exchange.BYBIT,
+                symbol=contract.symbol,
+                exchange=Exchange.GLOBAL,
                 orderid=d["orderLinkId"],
                 tradeid=d["execId"],
                 direction=DIRECTION_BYBIT2VT[d["side"]],
@@ -1651,9 +1764,14 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             packet: Order update data from websocket
         """
         for d in packet["data"]:
+            category: str = d.get("category", "")
+            contract: ContractData | None = self.gateway.get_contract_by_name(d["symbol"], category)
+            if not contract:
+                continue
+
             order: OrderData = OrderData(
-                symbol=d["symbol"],
-                exchange=Exchange.BYBIT,
+                symbol=contract.symbol,
+                exchange=Exchange.GLOBAL,
                 orderid=d["orderLinkId"],
                 type=ORDER_TYPE_BYBIT2VT[d["orderType"]],
                 direction=DIRECTION_BYBIT2VT[d["side"]],
@@ -1684,6 +1802,11 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             packet: Position update data from websocket
         """
         for d in packet["data"]:
+            category: str = d.get("category", "")
+            contract: ContractData | None = self.gateway.get_contract_by_name(d["symbol"], category)
+            if not contract:
+                continue
+
             # Determine position volume and direction from side field
             volume: float = 0
             if d["side"] == "Buy":
@@ -1692,8 +1815,8 @@ class BybitPrivateWebsocketApi(WebsocketClient):
                 volume = -float(d["size"])
 
             position: PositionData = PositionData(
-                symbol=d["symbol"],
-                exchange=Exchange.BYBIT,
+                symbol=contract.symbol,
+                exchange=Exchange.GLOBAL,
                 direction=Direction.NET,
                 volume=volume,
                 price=float(d["entryPrice"]),
@@ -1819,6 +1942,14 @@ class BybitTradeWebsocketApi(WebsocketClient):
         order: OrderData = req.create_order_data(orderid, self.gateway_name)
         self.gateway.on_order(order)
 
+        # Look up contract for exchange name
+        contract: ContractData | None = self.gateway.get_contract_by_symbol(req.symbol)
+        if not contract:
+            self.gateway.write_log(f"Failed to send order, symbol not found: {req.symbol}")
+            order.status = Status.REJECTED
+            self.gateway.on_order(order)
+            return order.vt_orderid
+
         # Prepare timestamp and receive window for signature
         timestamp: int = int(time.time() * 1000) - self.time_offset
         recv_window: int = 30_000
@@ -1830,7 +1961,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
         # Create order parameters
         args: dict = {
             "category": symbol_category_map.get(req.symbol, ""),
-            "symbol": req.symbol,
+            "symbol": contract.name,
             "orderType": ORDER_TYPE_VT2BYBIT[req.type],
             "side": DIRECTION_VT2BYBIT[req.direction],
             "qty": str(req.volume),
@@ -1876,6 +2007,12 @@ class BybitTradeWebsocketApi(WebsocketClient):
         Parameters:
             req: Cancel request object containing order details
         """
+        # Look up contract for exchange name
+        contract: ContractData | None = self.gateway.get_contract_by_symbol(req.symbol)
+        if not contract:
+            self.gateway.write_log(f"Failed to cancel order, symbol not found: {req.symbol}")
+            return
+
         # Generate unique request ID for tracking
         reqid: str = f"cancel_{uuid.uuid4()}"
 
@@ -1885,7 +2022,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
 
         args: dict = {
             "category": symbol_category_map.get(req.symbol, ""),
-            "symbol": req.symbol
+            "symbol": contract.name
         }
 
         # Determine the type of order ID to use for cancellation
@@ -2017,7 +2154,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
 
             order: OrderData = OrderData(
                 symbol="",
-                exchange=Exchange.BYBIT,
+                exchange=Exchange.GLOBAL,
                 orderid=orderid,
                 type=OrderType.LIMIT,
                 direction=Direction.LONG,
