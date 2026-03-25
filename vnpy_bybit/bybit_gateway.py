@@ -2136,7 +2136,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
 
         if "reqId" in packet:
             reqid: str = packet["reqId"]
-            if reqid in self.reqid_orderid_map:
+            if reqid in self.reqid_order_map:
                 self.on_send_order(packet)
             else:
                 self.on_cancel_order(packet)
