@@ -1886,7 +1886,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
         }
 
         self.order_callbacks: dict[str, Callable] = {}
-        self.reqid_orderid_map: dict[str, str] = {}
+        self.reqid_order_map: dict[str, OrderData] = {}
         self.is_connected: bool = False
 
     def connect(
@@ -1983,7 +1983,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
 
         # Generate unique request ID for tracking
         reqid: str = str(uuid.uuid4())
-        self.reqid_orderid_map[reqid] = orderid
+        self.reqid_order_map[reqid] = order
 
         # Create order parameters
         args: dict = {
@@ -2177,24 +2177,15 @@ class BybitTradeWebsocketApi(WebsocketClient):
             packet: Order response data from websocket
         """
         reqid: str = packet["reqId"]
-        orderid: str = self.reqid_orderid_map.pop(reqid, "")
+        order: OrderData | None = self.reqid_order_map.pop(reqid, None)
 
         if packet["retCode"] != 0:
             self.gateway.write_log(f"Send order failed: {packet['retMsg']}")
             print(f"send order error: {packet}")
 
-            order: OrderData = OrderData(
-                symbol="",
-                exchange=Exchange.GLOBAL,
-                orderid=orderid,
-                type=OrderType.LIMIT,
-                direction=Direction.LONG,
-                price=0,
-                volume=0,
-                status=Status.REJECTED,
-                gateway_name=self.gateway_name
-            )
-            self.gateway.on_order(order)
+            if order is not None:
+                order.status = Status.REJECTED
+                self.gateway.on_order(order)
 
     def on_cancel_order(self, packet: dict) -> None:
         """
