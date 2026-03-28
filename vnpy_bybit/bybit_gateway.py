@@ -2234,8 +2234,7 @@ def generate_datetime(timestamp: int) -> datetime:
     Returns:
         datetime: Datetime object with Shanghai timezone
     """
-    dt: datetime = datetime.fromtimestamp(timestamp / 1000)
-    return dt.replace(tzinfo=BYBIT_TZ)
+    return datetime.fromtimestamp(timestamp / 1000, tz=BYBIT_TZ)
 
 
 def prepare_payload(method: str, parameters: dict) -> str:
