@@ -23,7 +23,7 @@
 from .bybit_gateway import BybitGateway
 
 
-__version__ = "2026.03.25"
+__version__ = "2026.03.28"
 
 
 __all__ = ["BybitGateway"]
