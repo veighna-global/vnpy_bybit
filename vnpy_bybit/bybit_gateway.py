@@ -1402,17 +1402,18 @@ class BybitPublicWebsocketApi:
             self.subscribe_topic(client, f"tickers.{contract.name}", self.on_ticker)
             self.subscribe_topic(client, f"orderbook.{depth}.{contract.name}", self.on_depth)
 
-    def on_disconnected(self, category: str, status_code: int, msg: str) -> None:
+    def on_disconnected(self, status_code: int, msg: str, category: str = "") -> None:
         """
         Callback when server is disconnected.
 
         Parameters:
-            category: The product category that was disconnected
             status_code: WebSocket close status code
             msg: Disconnect message
+            category: The product category that was disconnected
         """
-        client: WebsocketClient = self.get_client(category)
-        client.is_connected = False
+        client: WebsocketClient | None = self.clients.get(category, None)
+        if client:
+            client.is_connected = False
 
         self.gateway.write_log(f"Public websocket stream of {category} is disconnected")
 
