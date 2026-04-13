@@ -1,3 +1,7 @@
+# 2026.04.13
+
+1. fix duplicate category parameter when calling partial of on_disconnected
+
 # 2026.03.28
 
 1. fix timezone bug of datetime field
