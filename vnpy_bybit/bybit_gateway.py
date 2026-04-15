@@ -39,8 +39,8 @@ from vnpy_rest import Request, Response, RestClient
 from vnpy_websocket import WebsocketClient
 
 
-# Timezone
-BYBIT_TZ: ZoneInfo = ZoneInfo("Asia/Shanghai")
+# UTC timezone
+UTC_TZ: ZoneInfo = ZoneInfo("UTC")
 
 # Real server hosts
 REAL_REST_HOST: str = "https://api.bybit.com"
@@ -1315,7 +1315,7 @@ class BybitPublicWebsocketApi:
         tick: TickData = TickData(
             symbol=req.symbol,
             exchange=req.exchange,
-            datetime=datetime.now(),
+            datetime=datetime.now(UTC_TZ),
             name=contract.name,
             gateway_name=self.gateway_name
         )
@@ -2233,9 +2233,9 @@ def generate_datetime(timestamp: int) -> datetime:
         timestamp: Unix timestamp in milliseconds
 
     Returns:
-        datetime: Datetime object with Shanghai timezone
+        datetime: Datetime object with UTC timezone
     """
-    return datetime.fromtimestamp(timestamp / 1000, tz=BYBIT_TZ)
+    return datetime.fromtimestamp(timestamp / 1000, tz=UTC_TZ)
 
 
 def prepare_payload(method: str, parameters: dict) -> str:
