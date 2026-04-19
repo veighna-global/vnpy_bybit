@@ -1,3 +1,7 @@
+# 2026.04.19
+
+1. monitor heartbeat state and auto reconnect if necessary
+
 # 2026.04.15
 
 1. change timezone to UTC
