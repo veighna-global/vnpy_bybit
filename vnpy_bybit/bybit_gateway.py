@@ -135,6 +135,11 @@ TICK_FIELD_BYBIT2VT: dict[str, str] = {
 # Global data storage
 symbol_category_map: dict[str, str] = {}
 
+# Heartbeat configuration
+HEARTBEAT_INTERVAL: int = 20
+HEARTBEAT_RECEIVE_TIMEOUT: int = 60
+MAX_MISSED_PONGS: int = 3
+
 
 class BybitGateway(BaseGateway):
     """
@@ -174,6 +179,7 @@ class BybitGateway(BaseGateway):
         self.name_contract_map: dict[str, ContractData] = {}
 
         self.timer_count: int = 0
+        self.heartbeat_interval: int = HEARTBEAT_INTERVAL
 
     def connect(self, setting: dict) -> None:
         """
@@ -355,7 +361,7 @@ class BybitGateway(BaseGateway):
             event: Timer event object
         """
         self.timer_count += 1
-        if self.timer_count < 20:
+        if self.timer_count < self.heartbeat_interval:
             return
         self.timer_count = 0
 
@@ -1194,6 +1200,9 @@ class BybitPublicWebsocketApi:
             "ping": self.on_heartbeat,
             "pong": self.on_heartbeat
         }
+        self.awaiting_pong_map: dict[str, bool] = {}
+        self.missed_pongs_map: dict[str, int] = {}
+        self.max_missed_pongs: int = MAX_MISSED_PONGS
 
     def connect(
         self,
@@ -1225,6 +1234,9 @@ class BybitPublicWebsocketApi:
         for client in self.clients.values():
             client.stop()
 
+        self.awaiting_pong_map.clear()
+        self.missed_pongs_map.clear()
+
     def get_client(self, category: str) -> WebsocketClient:
         """
         Get the websocket client of specific category.
@@ -1247,6 +1259,7 @@ class BybitPublicWebsocketApi:
         self.clients[category] = client
 
         client.is_connected = False
+        self.reset_heartbeat_state(category)
 
         # Bind callbacks with category parameter using partial
         client.on_connected = partial(self.on_connected, category=category)
@@ -1280,7 +1293,13 @@ class BybitPublicWebsocketApi:
         host: str = category_host_map[category]
 
         # Start connection
-        client.init(host, self.proxy_host, self.proxy_port)
+        client.init(
+            host,
+            self.proxy_host,
+            self.proxy_port,
+            ping_interval=HEARTBEAT_INTERVAL,
+            receive_timeout=HEARTBEAT_RECEIVE_TIMEOUT
+        )
         client.start()
 
         # Return object
@@ -1364,10 +1383,25 @@ class BybitPublicWebsocketApi:
         This method sends a ping message to keep the websocket
         connections alive.
         """
-        for client in self.clients.values():
-            if client.is_connected:
-                req: dict = {"op": "ping"}
-                client.send_packet(req)
+        for category, client in self.clients.items():
+            if not client.is_connected:
+                continue
+
+            if self.awaiting_pong_map.get(category, False):
+                self.missed_pongs_map[category] = self.missed_pongs_map.get(category, 0) + 1
+            else:
+                self.missed_pongs_map[category] = 0
+
+            if self.missed_pongs_map[category] >= self.max_missed_pongs:
+                self.gateway.write_log(
+                    f"Public websocket stream of {category} heartbeat stale, reconnecting"
+                )
+                self.reconnect_client(category)
+                continue
+
+            req: dict = {"op": "ping"}
+            client.send_packet(req)
+            self.awaiting_pong_map[category] = True
 
     def on_connected(self, category: str) -> None:
         """
@@ -1381,6 +1415,7 @@ class BybitPublicWebsocketApi:
         """
         client: WebsocketClient = self.clients[category]
         client.is_connected = True
+        self.reset_heartbeat_state(category)
 
         self.gateway.write_log(f"Public websocket stream of {category} is connected")
 
@@ -1414,6 +1449,7 @@ class BybitPublicWebsocketApi:
         client: WebsocketClient | None = self.clients.get(category, None)
         if client:
             client.is_connected = False
+        self.reset_heartbeat_state(category)
 
         self.gateway.write_log(f"Public websocket stream of {category} is disconnected")
 
@@ -1437,7 +1473,10 @@ class BybitPublicWebsocketApi:
             channel = packet["op"]
             callback = self.callbacks.get(channel, None)
             if callback:
-                callback(packet)
+                if channel in {"ping", "pong"}:
+                    callback(packet, category)
+                else:
+                    callback(packet)
 
     def on_error(self, e: Exception, category: str = "") -> None:
         """
@@ -1524,9 +1563,24 @@ class BybitPublicWebsocketApi:
 
         self.gateway.on_tick(copy(tick))
 
-    def on_heartbeat(self, packet: dict) -> None:
+    def reset_heartbeat_state(self, category: str) -> None:
+        """Reset heartbeat state for one public websocket client."""
+        self.awaiting_pong_map[category] = False
+        self.missed_pongs_map[category] = 0
+
+    def reconnect_client(self, category: str) -> None:
+        """Reconnect a stale public websocket client."""
+        client: WebsocketClient | None = self.clients.pop(category, None)
+        self.reset_heartbeat_state(category)
+
+        if client:
+            client.stop()
+
+        self.get_client(category)
+
+    def on_heartbeat(self, packet: dict, category: str) -> None:
         """Callback of heartbeat pong."""
-        pass
+        self.reset_heartbeat_state(category)
 
 
 class BybitPrivateWebsocketApi(WebsocketClient):
@@ -1556,6 +1610,9 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         }
 
         self.is_connected: bool = False
+        self.awaiting_pong: bool = False
+        self.missed_pongs: int = 0
+        self.max_missed_pongs: int = MAX_MISSED_PONGS
 
     def connect(
         self,
@@ -1592,7 +1649,13 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         }
 
         url: str = server_hosts[self.server]
-        self.init(url, self.proxy_host, self.proxy_port)
+        self.init(
+            url,
+            self.proxy_host,
+            self.proxy_port,
+            ping_interval=HEARTBEAT_INTERVAL,
+            receive_timeout=HEARTBEAT_RECEIVE_TIMEOUT
+        )
         self.start()
 
     def login(self) -> None:
@@ -1644,9 +1707,22 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         This method sends a ping message to keep the websocket
         connection alive.
         """
-        if self.is_connected:
-            req: dict = {"op": "ping"}
-            self.send_packet(req)
+        if not self.is_connected:
+            return
+
+        if self.awaiting_pong:
+            self.missed_pongs += 1
+        else:
+            self.missed_pongs = 0
+
+        if self.missed_pongs >= self.max_missed_pongs:
+            self.gateway.write_log("Private websocket stream heartbeat stale, reconnecting")
+            self.reconnect()
+            return
+
+        req: dict = {"op": "ping"}
+        self.send_packet(req)
+        self.awaiting_pong = True
 
     def on_connected(self) -> None:
         """
@@ -1657,6 +1733,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         initiates the login process.
         """
         self.is_connected = True
+        self.reset_heartbeat_state()
         self.gateway.write_log("Private websocket stream is connected")
         self.login()
 
@@ -1669,6 +1746,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             msg: Disconnect message
         """
         self.is_connected = False
+        self.reset_heartbeat_state()
         self.gateway.write_log("Private websocket stream is disconnected")
 
     def on_packet(self, packet: dict) -> None:
@@ -1855,9 +1933,26 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             )
             self.gateway.on_position(position)
 
+    def reset_heartbeat_state(self) -> None:
+        """Reset heartbeat state for the private websocket session."""
+        self.awaiting_pong = False
+        self.missed_pongs = 0
+
+    def reconnect(self) -> None:
+        """Reconnect a stale private websocket session."""
+        self.reset_heartbeat_state()
+        self.stop()
+        self.connect(
+            self.key,
+            self.secret,
+            self.server,
+            self.proxy_host,
+            self.proxy_port
+        )
+
     def on_heartbeat(self, packet: dict) -> None:
         """Callback of heartbeat pong."""
-        pass
+        self.reset_heartbeat_state()
 
 
 class BybitTradeWebsocketApi(WebsocketClient):
@@ -1889,6 +1984,9 @@ class BybitTradeWebsocketApi(WebsocketClient):
         self.order_callbacks: dict[str, Callable] = {}
         self.reqid_order_map: dict[str, OrderData] = {}
         self.is_connected: bool = False
+        self.awaiting_pong: bool = False
+        self.missed_pongs: int = 0
+        self.max_missed_pongs: int = MAX_MISSED_PONGS
 
     def connect(
         self,
@@ -1925,7 +2023,13 @@ class BybitTradeWebsocketApi(WebsocketClient):
         }
 
         url: str = server_hosts[self.server]
-        self.init(url, self.proxy_host, self.proxy_port)
+        self.init(
+            url,
+            self.proxy_host,
+            self.proxy_port,
+            ping_interval=HEARTBEAT_INTERVAL,
+            receive_timeout=HEARTBEAT_RECEIVE_TIMEOUT
+        )
         self.start()
 
     def login(self) -> None:
@@ -2090,9 +2194,22 @@ class BybitTradeWebsocketApi(WebsocketClient):
         This method sends a ping message to keep the websocket
         connection alive.
         """
-        if self.is_connected:
-            req: dict = {"op": "ping"}
-            self.send_packet(req)
+        if not self.is_connected:
+            return
+
+        if self.awaiting_pong:
+            self.missed_pongs += 1
+        else:
+            self.missed_pongs = 0
+
+        if self.missed_pongs >= self.max_missed_pongs:
+            self.gateway.write_log("Trade websocket stream heartbeat stale, reconnecting")
+            self.reconnect()
+            return
+
+        req: dict = {"op": "ping"}
+        self.send_packet(req)
+        self.awaiting_pong = True
 
     def on_connected(self) -> None:
         """
@@ -2103,6 +2220,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
         initiates the login process.
         """
         self.is_connected = True
+        self.reset_heartbeat_state()
         self.gateway.write_log("Trade websocket stream is connected")
         self.login()
 
@@ -2115,6 +2233,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
             msg: Disconnect message
         """
         self.is_connected = False
+        self.reset_heartbeat_state()
         self.gateway.write_log("Trade websocket stream is disconnected")
 
     def on_packet(self, packet: dict) -> None:
@@ -2201,9 +2320,26 @@ class BybitTradeWebsocketApi(WebsocketClient):
         if packet["retCode"] != 0:
             self.gateway.write_log(f"Cancel order failed: {packet['retMsg']}")
 
+    def reset_heartbeat_state(self) -> None:
+        """Reset heartbeat state for the trade websocket session."""
+        self.awaiting_pong = False
+        self.missed_pongs = 0
+
+    def reconnect(self) -> None:
+        """Reconnect a stale trade websocket session."""
+        self.reset_heartbeat_state()
+        self.stop()
+        self.connect(
+            self.key,
+            self.secret,
+            self.server,
+            self.proxy_host,
+            self.proxy_port
+        )
+
     def on_heartbeat(self, packet: dict) -> None:
         """Callback of heartbeat pong."""
-        pass
+        self.reset_heartbeat_state()
 
 
 def generate_signature(secret: str, param_str: str) -> str:
