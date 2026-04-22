@@ -1,3 +1,7 @@
+# 2026.04.22
+
+1. delay order / position / account query after all contract received
+
 # 2026.04.19
 
 1. monitor heartbeat state and auto reconnect if necessary
