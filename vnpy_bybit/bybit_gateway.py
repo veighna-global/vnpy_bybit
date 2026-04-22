@@ -391,6 +391,9 @@ class BybitRestApi(RestClient):
         self.time_offset: int = 0
         self.order_count: int = 0
 
+        self.pending_categories: set[str] = set()
+        self.query_sent: bool = False
+
     def sign(self, request: Request) -> Request:
         """
         Standard callback for signing a request.
@@ -509,7 +512,11 @@ class BybitRestApi(RestClient):
         This function sends requests to get exchange information for all
         supported product categories (spot, linear, inverse, option).
         """
-        for category in ["spot", "linear", "inverse", "option"]:
+        categories: list[str] = ["spot", "linear", "inverse", "option"]
+        self.pending_categories = set(categories)
+        self.query_sent = False
+
+        for category in categories:
             params: dict = {
                 "category": category,
                 "limit": 1000
@@ -880,9 +887,6 @@ class BybitRestApi(RestClient):
         self.gateway.write_log(f"Server time updated, local offset: {self.time_offset} ms")
 
         self.query_contract()
-        self.query_order()
-        self.query_account()
-        self.query_position()
 
     def on_query_contract(self, data: dict, request: Request) -> None:
         """
@@ -965,6 +969,15 @@ class BybitRestApi(RestClient):
                 self.on_query_contract,
                 params=params
             )
+        elif category in self.pending_categories:
+            self.pending_categories.remove(category)
+
+            if not self.pending_categories and not self.query_sent:
+                self.query_sent = True
+
+                self.query_order()
+                self.query_account()
+                self.query_position()
 
     def on_query_order(self, data: dict, request: Request) -> None:
         """
