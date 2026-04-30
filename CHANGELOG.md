@@ -1,3 +1,7 @@
+# 2026.04.30
+
+1. fix bug failed to query USDT based position
+
 # 2026.04.22
 
 1. delay order / position / account query after all contract received

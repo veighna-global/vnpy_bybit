@@ -600,7 +600,7 @@ class BybitRestApi(RestClient):
                         params=params
                     )
             else:
-                params: dict = {
+                params = {
                     "category": category,
                     "limit": 200
                 }
