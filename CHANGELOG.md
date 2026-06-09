@@ -1,3 +1,7 @@
+# 2026.06.09
+
+1. fix missing AccountData.frozen
+
 # 2026.04.30
 
 1. fix bug failed to query USDT based position
