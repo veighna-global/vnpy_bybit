@@ -1052,19 +1052,9 @@ class BybitRestApi(RestClient):
 
         for d in result["list"]:
             for coin_data in d["coin"]:
-                balance: float = 0
-                if coin_data["walletBalance"]:
-                    balance = float(coin_data["walletBalance"])
-
-                available: float = 0
-                if coin_data["availableToWithdraw"]:
-                    available = float(coin_data["availableToWithdraw"])
-
-                account: AccountData = AccountData(
-                    accountid=coin_data["coin"],
-                    balance=balance,
-                    frozen=balance - available,
-                    gateway_name=self.gateway_name,
+                account: AccountData = parse_bybit_account_data(
+                    coin_data,
+                    self.gateway_name,
                 )
                 self.gateway.on_account(account)
 
@@ -1833,19 +1823,9 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         """
         for d in packet["data"]:
             for coin_data in d["coin"]:
-                balance: float = 0
-                if coin_data["walletBalance"]:
-                    balance = float(coin_data["walletBalance"])
-
-                available: float = 0
-                if coin_data["availableToWithdraw"]:
-                    available = float(coin_data["availableToWithdraw"])
-
-                account: AccountData = AccountData(
-                    accountid=coin_data["coin"],
-                    balance=balance,
-                    frozen=balance - available,
-                    gateway_name=self.gateway_name,
+                account: AccountData = parse_bybit_account_data(
+                    coin_data,
+                    self.gateway_name,
                 )
                 self.gateway.on_account(account)
 
@@ -2357,6 +2337,42 @@ class BybitTradeWebsocketApi(WebsocketClient):
     def on_heartbeat(self, packet: dict) -> None:
         """Callback of heartbeat pong."""
         self.reset_heartbeat_state()
+
+
+def parse_bybit_amount(value: str | float | int | None) -> float:
+    """
+    Parse numeric amount from Bybit API response.
+
+    Bybit may return empty strings for unavailable fields,
+    such as totalOrderIM under portfolio margin mode.
+    """
+    if value is None or value == "":
+        return 0.0
+    return float(value)
+
+
+def parse_bybit_account_data(coin_data: dict, gateway_name: str) -> AccountData:
+    """
+    Create AccountData from Bybit coin balance data.
+
+    For UNIFIED accounts, availableToWithdraw is deprecated and often
+    returns zero. Use locked, totalOrderIM and totalPositionIM instead.
+    """
+    balance: float = parse_bybit_amount(coin_data.get("walletBalance"))
+
+    frozen: float = (
+        parse_bybit_amount(coin_data.get("locked"))
+        + parse_bybit_amount(coin_data.get("totalOrderIM"))
+        + parse_bybit_amount(coin_data.get("totalPositionIM"))
+        + parse_bybit_amount(coin_data.get("bonus"))
+    )
+
+    return AccountData(
+        accountid=coin_data["coin"],
+        balance=balance,
+        frozen=frozen,
+        gateway_name=gateway_name,
+    )
 
 
 def generate_signature(secret: str, param_str: str) -> str:
