@@ -1304,7 +1304,7 @@ class BybitPublicWebsocketApi:
             host,
             self.proxy_host,
             self.proxy_port,
-            ping_interval=HEARTBEAT_INTERVAL,
+            ping_interval=0,
             receive_timeout=HEARTBEAT_RECEIVE_TIMEOUT
         )
         client.start()
@@ -1383,6 +1383,18 @@ class BybitPublicWebsocketApi:
         }
         client.send_packet(req)
 
+    def _send_packet(self, category: str, client: WebsocketClient, packet: dict) -> bool:
+        """Send packet and mark the client down if the socket is already closed."""
+        try:
+            client.send_packet(packet)
+            return True
+        except Exception as e:
+            detail: str = str(e).replace("{", "{{").replace("}", "}}")
+            client.is_connected = False
+            self.reset_heartbeat_state(category)
+            self.gateway.write_log(f"Public websocket stream of {category} send failed: {detail}")
+            return False
+
     def send_heartbeat(self) -> None:
         """
         Send heartbeat ping to all connected clients.
@@ -1390,7 +1402,7 @@ class BybitPublicWebsocketApi:
         This method sends a ping message to keep the websocket
         connections alive.
         """
-        for category, client in self.clients.items():
+        for category, client in list(self.clients.items()):
             if not client.is_connected:
                 continue
 
@@ -1407,7 +1419,10 @@ class BybitPublicWebsocketApi:
                 continue
 
             req: dict = {"op": "ping"}
-            client.send_packet(req)
+            if not self._send_packet(category, client, req):
+                self.reconnect_client(category)
+                continue
+
             self.awaiting_pong_map[category] = True
 
     def on_connected(self, category: str) -> None:
@@ -1660,7 +1675,7 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             url,
             self.proxy_host,
             self.proxy_port,
-            ping_interval=HEARTBEAT_INTERVAL,
+            ping_interval=0,
             receive_timeout=HEARTBEAT_RECEIVE_TIMEOUT
         )
         self.start()
@@ -1707,6 +1722,18 @@ class BybitPrivateWebsocketApi(WebsocketClient):
         }
         self.send_packet(req)
 
+    def _send_packet(self, packet: dict) -> bool:
+        """Send packet and mark the session down if the socket is already closed."""
+        try:
+            self.send_packet(packet)
+            return True
+        except Exception as e:
+            detail: str = str(e).replace("{", "{{").replace("}", "}}")
+            self.is_connected = False
+            self.reset_heartbeat_state()
+            self.gateway.write_log(f"Private websocket stream send failed: {detail}")
+            return False
+
     def send_heartbeat(self) -> None:
         """
         Send heartbeat ping to server.
@@ -1728,7 +1755,10 @@ class BybitPrivateWebsocketApi(WebsocketClient):
             return
 
         req: dict = {"op": "ping"}
-        self.send_packet(req)
+        if not self._send_packet(req):
+            self.reconnect()
+            return
+
         self.awaiting_pong = True
 
     def on_connected(self) -> None:
@@ -2024,7 +2054,7 @@ class BybitTradeWebsocketApi(WebsocketClient):
             url,
             self.proxy_host,
             self.proxy_port,
-            ping_interval=HEARTBEAT_INTERVAL,
+            ping_interval=0,
             receive_timeout=HEARTBEAT_RECEIVE_TIMEOUT
         )
         self.start()
@@ -2184,6 +2214,18 @@ class BybitTradeWebsocketApi(WebsocketClient):
         }
         self.send_packet(req_data)
 
+    def _send_packet(self, packet: dict) -> bool:
+        """Send packet and mark the session down if the socket is already closed."""
+        try:
+            self.send_packet(packet)
+            return True
+        except Exception as e:
+            detail: str = str(e).replace("{", "{{").replace("}", "}}")
+            self.is_connected = False
+            self.reset_heartbeat_state()
+            self.gateway.write_log(f"Trade websocket stream send failed: {detail}")
+            return False
+
     def send_heartbeat(self) -> None:
         """
         Send heartbeat ping to server.
@@ -2205,7 +2247,10 @@ class BybitTradeWebsocketApi(WebsocketClient):
             return
 
         req: dict = {"op": "ping"}
-        self.send_packet(req)
+        if not self._send_packet(req):
+            self.reconnect()
+            return
+
         self.awaiting_pong = True
 
     def on_connected(self) -> None:
