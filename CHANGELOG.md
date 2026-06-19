@@ -1,3 +1,8 @@
+# 2026.06.19
+
+1. improve heartbeat mechanism
+2. fix querying active order bug
+
 # 2026.06.09
 
 1. fix missing AccountData.frozen
