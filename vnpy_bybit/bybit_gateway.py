@@ -538,12 +538,10 @@ class BybitRestApi(RestClient):
         contracts, it queries both USDT and USDC settled contracts.
         """
         for category in ["spot", "linear", "inverse", "option"]:
-            params: dict = {"category": category}
-
             if category == "linear":
                 # Query linear contracts separately for USDT and USDC settlement
                 for coin in ["USDT", "USDC"]:
-                    params["settleCoin"] = coin
+                    params: dict = {"category": category, "settleCoin": coin}
 
                     self.add_request(
                         "GET",
@@ -552,6 +550,8 @@ class BybitRestApi(RestClient):
                         params=params
                     )
             else:
+                params = {"category": category}
+
                 self.add_request(
                     "GET",
                     "/v5/order/realtime",
